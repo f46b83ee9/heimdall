@@ -1,0 +1,74 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Heimdall Policy",
+  "type": "object",
+  "required": ["name", "effect", "subjects", "actions", "scope", "filters"],
+  "properties": {
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Unique name for the policy"
+    },
+    "effect": {
+      "type": "string",
+      "enum": ["allow", "deny"],
+      "description": "Policy effect: allow or deny (deny always wins)"
+    },
+    "subjects": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["type", "id"],
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": ["user", "group"]
+          },
+          "id": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      },
+      "description": "Subjects this policy applies to"
+    },
+    "actions": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string",
+        "enum": ["read", "write", "rules:read", "rules:write", "alerts:read", "alerts:write", "*"]
+      },
+      "description": "Actions this policy grants or denies"
+    },
+    "scope": {
+      "type": "object",
+      "required": ["tenants"],
+      "properties": {
+        "tenants": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string"
+          },
+          "description": "Tenant IDs (use * for all registered tenants)"
+        },
+        "resources": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Resource types (e.g., metrics)"
+        }
+      }
+    },
+    "filters": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "PromQL label matchers. Empty array [] grants full unfiltered access."
+    }
+  }
+}
