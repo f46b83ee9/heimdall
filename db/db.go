@@ -12,8 +12,30 @@ import (
 	"time"
 
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	"gorm.io/gorm"
 )
+
+type contextKey string
+
+const (
+	noTraceKey contextKey = "heimdall_no_trace"
+)
+
+// WithNoTrace returns a new context that signals DB operations to skip span creation.
+// This is used for periodic background tasks (e.g., bundle polling) to reduce trace noise.
+func WithNoTrace(ctx context.Context) context.Context {
+	return context.WithValue(ctx, noTraceKey, true)
+}
+
+func shouldTrace(ctx context.Context) bool {
+	v := ctx.Value(noTraceKey)
+	if v == nil {
+		return true
+	}
+	b, ok := v.(bool)
+	return !ok || !b
+}
 
 // JSONField is a custom type that properly implements sql.Scanner and driver.Valuer
 // for storing JSON data in both Postgres and SQLite.
@@ -153,12 +175,17 @@ func (s *Store) GetTenant(ctx context.Context, id string) (*Tenant, error) {
 
 // ListTenants returns all tenants.
 func (s *Store) ListTenants(ctx context.Context) ([]Tenant, error) {
-	ctx, span := tracer.Start(ctx, "db.ListTenants")
-	defer span.End()
+	if shouldTrace(ctx) {
+		var span trace.Span
+		ctx, span = tracer.Start(ctx, "db.ListTenants")
+		defer span.End()
+	}
 
 	var tenants []Tenant
 	if err := s.db.WithContext(ctx).Find(&tenants).Error; err != nil {
-		span.RecordError(err)
+		if span := trace.SpanFromContext(ctx); span.IsRecording() && shouldTrace(ctx) {
+			span.RecordError(err)
+		}
 		return nil, fmt.Errorf("listing tenants: %w", err)
 	}
 	return tenants, nil
@@ -218,12 +245,17 @@ func (s *Store) GetPolicy(ctx context.Context, id uint) (*Policy, error) {
 
 // ListPolicies returns all policies.
 func (s *Store) ListPolicies(ctx context.Context) ([]Policy, error) {
-	ctx, span := tracer.Start(ctx, "db.ListPolicies")
-	defer span.End()
+	if shouldTrace(ctx) {
+		var span trace.Span
+		ctx, span = tracer.Start(ctx, "db.ListPolicies")
+		defer span.End()
+	}
 
 	var policies []Policy
 	if err := s.db.WithContext(ctx).Find(&policies).Error; err != nil {
-		span.RecordError(err)
+		if span := trace.SpanFromContext(ctx); span.IsRecording() && shouldTrace(ctx) {
+			span.RecordError(err)
+		}
 		return nil, fmt.Errorf("listing policies: %w", err)
 	}
 	return policies, nil

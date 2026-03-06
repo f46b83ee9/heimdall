@@ -261,7 +261,7 @@ func (bs *BundleServer) StartPolling(ctx context.Context, interval time.Duration
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				if err := bs.Rebuild(ctx); err != nil {
+				if err := bs.Rebuild(WithNoTrace(ctx)); err != nil {
 					slog.ErrorContext(ctx, "bundle polling rebuild failed", "error", err)
 				}
 			}
@@ -294,7 +294,7 @@ func (bs *BundleServer) StartListenNotify(ctx context.Context, interval time.Dur
 
 	// Fall back to polling since database/sql cannot receive async notifications.
 	// The caller (serve.go) would need pgx/lib-pq for true push-based change detection.
-	bs.StartPolling(ctx, interval)
+	bs.StartPolling(WithNoTrace(ctx), interval)
 
 	return nil
 }

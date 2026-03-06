@@ -161,20 +161,29 @@ bundles:
 ./heimdall tenant create acme "Acme Corp" --config=config.yaml
 ./heimdall tenant create globex "Globex Inc" --config=config.yaml
 
-# Create a policy (allow alice to read acme metrics with env="prod" filter)
-./heimdall policy create --config=config.yaml \
-  --name="allow-alice-read-acme" \
-  --effect=allow \
-  --subjects='[{"type":"user","id":"alice@acme.com"}]' \
-  --actions='["read"]' \
-  --scope='{"tenants":["acme"], "resources":["metrics"]}' \
-  --filters='["env=\"prod\""]'
-
-# Batch create policies from a JSON file
+# Create policies from a JSON file (standard way)
 ./heimdall policy create policies.json --config=config.yaml
 
-# Batch create policies from stdin
+# Create policies from stdin
 cat policies.json | ./heimdall policy create - --config=config.yaml
+```
+
+### Policy Example (`policies.json`)
+
+```json
+[
+  {
+    "name": "allow-alice-read-acme",
+    "effect": "allow",
+    "subjects": [{"type": "user", "id": "alice@acme.com"}],
+    "actions": ["read"],
+    "scope": {
+      "tenants": ["acme"],
+      "resources": ["metrics"]
+    },
+    "filters": ["env=\"prod\""]
+  }
+]
 ```
 
 ## Observability & Instrumentation
