@@ -4,6 +4,9 @@ import (
 	"context"
 	"sync"
 	"time"
+
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
 )
 
 // CachedTenantLister adds an in-memory TTL cache to an underlying TenantLister
@@ -30,17 +33,23 @@ func NewCachedTenantLister(underlying TenantLister, ttl time.Duration, metrics *
 // ListTenantIDs returns tenant IDs from the cache if still valid; otherwise
 // refreshes from the underlying lister.
 func (c *CachedTenantLister) ListTenantIDs(ctx context.Context) ([]string, error) {
+	ctx, span := otel.Tracer("heimdall").Start(ctx, "handler.ListTenantIDs")
+	defer span.End()
+
 	c.mu.RLock()
 	if c.cachedIDs != nil && time.Now().Before(c.expiresAt) {
 		ids := c.cachedIDs // Return existing read-lock reference copy
 		c.mu.RUnlock()
 
+		span.SetAttributes(attribute.Bool("cache_hit", true))
 		if c.metrics != nil {
 			c.metrics.tenantCacheHits.Add(ctx, 1)
 		}
 		return ids, nil
 	}
 	c.mu.RUnlock()
+
+	span.SetAttributes(attribute.Bool("cache_hit", false))
 
 	// Cache miss: lock for write and fetch
 	c.mu.Lock()

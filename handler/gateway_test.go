@@ -15,7 +15,7 @@ import (
 )
 
 // mockOPAClient returns a mock OPA client that answers evaluations based on tenant ID.
-func mockOPAClient(t *testing.T, results map[string]OPAResult) (*OPAClient, func()) {
+func mockOPAClient(t *testing.T, results map[string]OPAResult) (OPAClient, func()) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var input struct {
 			Input OPAInput `json:"input"`
@@ -35,15 +35,21 @@ func mockOPAClient(t *testing.T, results map[string]OPAResult) (*OPAClient, func
 		})
 	}))
 
-	client := NewOPAClient(server.URL, "v1/data/proxy/authz", 1*time.Second, nil)
-	return client, server.Close
+	metrics, _ := NewMetrics()
+	opaClient := NewOPAClient(server.URL, "proxy/authz", 5*time.Second, nil, metrics)
+	return opaClient, server.Close
 }
 
 // setupInvariantEnv configures an isolated routing environment bypassing JWT authentication
 // directly injecting an identity, useful for testing invariant behavioral paths.
 func setupInvariantEnv(t *testing.T, upstreamStatus int, upstreamBody []byte, opaResult map[string]OPAResult, fanOutConcurrency int, upstreamDelay time.Duration) (*gin.Engine, *FanOutEngine) {
 	gin.SetMode(gin.TestMode)
-	otel.Init(context.Background(), "test-heimdall", "", false)
+	ctx := context.Background()
+	otelProvider, err := otel.Init(ctx, config.TelemetryConfig{Enabled: false})
+	if err != nil {
+		t.Fatalf("failed to initialize otel: %v", err)
+	}
+	defer otelProvider.Shutdown(ctx)
 
 	// Mock Mimir
 	mimir := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

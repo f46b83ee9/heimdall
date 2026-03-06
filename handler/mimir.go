@@ -10,6 +10,7 @@ import (
 
 	"github.com/f46b83ee9/heimdall/config"
 	"github.com/prometheus/prometheus/model/labels"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.opentelemetry.io/otel"
 )
 
@@ -38,7 +39,7 @@ type upstreamResult struct {
 
 // FanOutEngine orchestrates multi-tenant fan-out with bounded concurrency.
 type FanOutEngine struct {
-	opaClient  *OPAClient
+	opaClient  OPAClient
 	mimirCfg   config.MimirConfig
 	httpClient *http.Client
 	sem        chan struct{} // Global semaphore for bounded concurrency limits
@@ -47,12 +48,13 @@ type FanOutEngine struct {
 }
 
 // NewFanOutEngine creates a new FanOutEngine with the given configuration.
-func NewFanOutEngine(opaClient *OPAClient, cfg config.MimirConfig, fanOutCfg config.FanOutConfig, transport http.RoundTripper, metrics *Metrics) *FanOutEngine {
+func NewFanOutEngine(opaClient OPAClient, cfg config.MimirConfig, fanOutCfg config.FanOutConfig, transport http.RoundTripper, metrics *Metrics) *FanOutEngine {
 	// Initialize global semaphore
 	sem := make(chan struct{}, fanOutCfg.MaxConcurrency)
 	client := &http.Client{
 		// The http.Client timeout acts as an absolute fallback
-		Timeout: cfg.Timeout,
+		Timeout:   cfg.Timeout,
+		Transport: otelhttp.NewTransport(http.DefaultTransport),
 	}
 	if transport != nil {
 		client.Transport = transport

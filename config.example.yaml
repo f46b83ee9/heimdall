@@ -1,0 +1,95 @@
+# Heimdall Configuration Example
+# Exhaustive documentation of all available settings.
+
+server:
+  # Main API listener (standard and fan-out endpoints)
+  main:
+    addr: ":9091"           # Address to listen on
+    read_timeout: 30s       # Timeout for reading the entire request
+    write_timeout: 30s      # Timeout for writing the response
+    idle_timeout: 120s      # Timeout for idle keep-alive connections
+    tls:                    # Optional: Server TLS settings
+      cert_file: ""         # Path to the server certificate
+      key_file: ""          # Path to the server private key
+      client_ca_file: ""    # Path to the CA used for client verification (mTLS)
+
+  # OPA Bundle server listener (used by OPA to download policies)
+  bundle:
+    addr: ":9092"
+    read_timeout: 30s
+    write_timeout: 30s
+    idle_timeout: 120s
+    tls:
+      cert_file: ""
+      key_file: ""
+      client_ca_file: ""
+
+  # Global log level for the application.
+  # Supported: debug, info, warn, error
+  log_level: "info"
+
+# Upstream Mimir (Prometheus) settings
+mimir:
+  url: "http://mimir:8080"                         # Base URL for Mimir/Prometheus
+  read_url: "http://mimir:8080/prometheus/api/v1/read"   # Optional: Specialized read endpoint
+  write_url: "http://mimir:8080/api/v1/push"             # Optional: Specialized write endpoint
+  ruler_url: "http://mimir:8080/prometheus/api/v1/rules" # Optional: Specialized ruler endpoint
+  alertmanager_url: "http://mimir:8080/api/v1/alerts"    # Optional: Specialized alertmanager endpoint
+  timeout: 30s                                     # Request timeout for upstream calls
+  insecure_skip_verify: false                      # Set to true to skip TLS verification for Mimir
+  auth:                                            # Optional: Upstream authentication
+    type: ""                                       # supported: basic, bearer, oauth2, api_key, mtls
+    # Basic auth fields
+    username: ""
+    password: ""
+    # Bearer auth field
+    token: ""
+    # OAuth2 Client Credentials fields
+    client_id: ""
+    client_secret: ""
+    token_url: ""
+    scopes: []
+    # API Key fields
+    api_key: ""
+    api_key_header: "X-API-Key"
+    # mTLS fields
+    cert_file: ""
+    key_file: ""
+    ca_file: ""
+
+# JWT Validation settings (Heimdall authenticates incoming requests via JWT)
+jwt:
+  jwks_url: ""              # URL to fetch public keys for token verification
+  issuer: ""                # Expected 'iss' claim
+  audience: ""              # Expected 'aud' claim
+  groups_claim: "groups"    # Claim containing user groups/roles
+  user_id_claim: "sub"      # Claim used for identifying the user
+
+# Open Policy Agent (OPA) settings
+opa:
+  url: "http://opa:8181"    # URL for OPA policy evaluation
+  policy_path: "v1/data/proxy/authz" # Path to the Rego policy inside OPA
+  timeout: 5s               # Request timeout for OPA evaluation
+  insecure_skip_verify: false # Set to true to skip TLS verification for OPA
+  auth:                     # Optional: Authentication for OPA API
+    type: ""                # supported: basic, bearer, api_key, mtls (same as mimir.auth)
+
+# Database settings for policy and tenant storage
+database:
+  driver: "postgres"        # supported: postgres, sqlite
+  dsn: "host=localhost user=heimdall password=heimdall dbname=heimdall port=5432 sslmode=disable"
+  refresh_interval: 5s      # How often to check for DB changes to notify OPA bundle server
+
+# Fan-out engine settings
+fanout:
+  max_concurrency: 10       # Maximum parallel requests to upstream tenants
+  timeout: 30s              # Global timeout for the entire fan-out operation
+
+# OpenTelemetry (OTel) observability settings
+telemetry:
+  enabled: false            # Enable OTel tracing
+  otlp_endpoint: "localhost:4317" # OTLP/gRPC collector endpoint
+  service_name: "heimdall"   # Service name appearing in traces
+  insecure_skip_verify: false # Set to true to skip TLS verification for OTLP collector
+  auth:                     # Optional: Authentication for OTLP collector
+    type: ""                # supported: basic, bearer, api_key, mtls (same as mimir.auth)

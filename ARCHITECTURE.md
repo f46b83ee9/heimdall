@@ -8,49 +8,49 @@
 
 The system follows a non-reorderable pipeline to ensure security and deterministic results.
 
+### Unified System Flow
+
+Heimdall maintains policy state via background synchronization while processing active proxy requests.
+
 ```mermaid
 sequenceDiagram
+    autonumber
     participant Client
-    participant Handler as Heimdall Handler
+    participant Admin as Admin/CLI
+    participant DB as SQL Database
+    participant BS as Bundle Server (Heimdall)
     participant OPA as OPA Engine
     participant Mimir as Upstream Mimir
-    participant DB as SQL (Postgres/SQLite)
 
-    Note over Handler: [1] Middleware & Tracing Entry
-    Client->>Handler: Request (JWT + X-Scope-OrgID)
+    Note over Admin, BS: [Background] Policy Synchronization
+    Admin->>DB: create tenant/policy
+    BS->>DB: Listen/Poll (1s)
+    DB-->>BS: change detected
+    BS->>DB: Fetch state
+    DB-->>BS: tenants + policies
+    BS->>BS: Rebuild tar.gz (in-memory)
+    OPA->>BS: GET /bundles/bundle.tar.gz (polling)
+    BS-->>OPA: tar.gz payload
+    Note over OPA: Policy Update Applied
+
+    Note over Client, Mimir: [Active] Request Processing
+    Client->>BS: Request (JWT + X-Scope-OrgID)
+    BS->>BS: Validate JWT & Resolve Identity
     
-    Note over Handler: [2] Identity & Tenant Resolution
-    Handler->>Handler: Validate JWT (Signature, Exp, Iss, Aud)
-    Handler->>Handler: Extract sub (user_id) & groups
-
-    loop [3] OPA Authorization Loop (Once per tenant)
-        Handler->>OPA: input: {user_id, groups, tenant_id, action}
-        OPA-->>Handler: {allow, effective_filters, accessible_tenants}
+    loop Per Tenant
+        BS->>OPA: Evaluate {user, groups, tenant, action}
+        OPA-->>BS: {allow, effective_filters}
     end
 
-    Note over Handler: [4] Authorization Check
-    alt Any Deny Matches OR No Allow Matches
-        Handler-->>Client: 403 Forbidden (JSON Envelope)
-    else Authorized
-        Note over Handler: [5] Fan-Out Grouping & AST Rewrite
-        Handler->>Handler: Group tenants by identical filter signatures
-
-        Note over Handler: [6] Upstream Dispatch (Parallel)
-        par Group A (Tenant 1|Tenant 2)
-            Handler->>Mimir: X-Scope-OrgID: T1|T2 + Rewritten Query
-            Mimir-->>Handler: Result A
-        and Group B (Tenant 3)
-            Handler->>Mimir: X-Scope-OrgID: T3 + Rewritten Query
-            Mimir-->>Handler: Result B
-        end
-
-        Note over Handler: [7] Response Handling
-        Handler->>Handler: Deterministic Lexicographical Merge
-        
-        Note over Handler: [8] Client Response
-        Handler-->>Client: 200 OK (Merged JSON)
+    alt Authorized
+        BS->>BS: PromQL Rewrite (Inject Filters)
+        BS->>Mimir: Parallel Fan-out (Rewritten Queries)
+        Mimir-->>BS: HTTP 200 (Sub-results)
+        BS->>BS: Lexicographical Merge
+        BS-->>Client: Final Merged JSON
+    else Forbidden
+        BS-->>Client: 403 Forbidden
     end
-
 ```
 
 ### Resource Safety & Concurrency
@@ -98,9 +98,8 @@ The handler derives the filter mode from the action; OPA does not return it.
 
 OPA is updated via an in-process bundle server that serves a data snapshot.
 
-* **Rebuild Triggers**: Bundle rebuilds are triggered synchronously by any policy or tenant change.
-* **Atomic Updates**: Rebuilds are mutex-protected and use a strict atomic rename pattern (write temp → fsync to disk → rename) to ensure OPA never reads a corrupted bundle.
-* **Update Mechanisms**: Uses PostgreSQL `LISTEN/NOTIFY` or SQLite polling (based on `refresh_interval`) to detect changes.
+* **Atomic Updates**: Rebuilds are mutex-protected and built in-memory to ensure OPA never reads a corrupted/partial bundle.
+* **Update Detection**: Uses PostgreSQL `LISTEN/NOTIFY` (detecting DB-level triggers) or background polling for SQLite.
 
 ---
 

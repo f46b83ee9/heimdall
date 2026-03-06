@@ -7,7 +7,7 @@ import (
 	"github.com/prometheus/prometheus/model/labels"
 )
 
-func TestRewriteQuery(t *testing.T) {
+func TestRewriting_PromQL_Injection(t *testing.T) {
 	ctx := context.Background()
 
 	tests := []struct {
@@ -70,6 +70,54 @@ func TestRewriteQuery(t *testing.T) {
 			matchers: []*labels.Matcher{labels.MustNewMatcher(labels.MatchEqual, "a", "b")},
 			wantErr:  true,
 		},
+		{
+			name:     "binary expression",
+			query:    "up + down",
+			matchers: []*labels.Matcher{labels.MustNewMatcher(labels.MatchEqual, "id", "1")},
+			want:     `up{id="1"} + down{id="1"}`,
+		},
+		{
+			name:     "subquery",
+			query:    "up[5m:1m]",
+			matchers: []*labels.Matcher{labels.MustNewMatcher(labels.MatchEqual, "id", "1")},
+			want:     `up{id="1"}[5m:1m]`,
+		},
+		{
+			name:     "call",
+			query:    "absent(up)",
+			matchers: []*labels.Matcher{labels.MustNewMatcher(labels.MatchEqual, "id", "1")},
+			want:     `absent(up{id="1"})`,
+		},
+		{
+			name:     "matrix selector",
+			query:    "rate(up[5m])",
+			matchers: []*labels.Matcher{labels.MustNewMatcher(labels.MatchEqual, "id", "1")},
+			want:     `rate(up{id="1"}[5m])`,
+		},
+		{
+			name:     "offset",
+			query:    "up offset 5m",
+			matchers: []*labels.Matcher{labels.MustNewMatcher(labels.MatchEqual, "id", "1")},
+			want:     `up{id="1"} offset 5m`,
+		},
+		{
+			name:     "paren expression",
+			query:    "(up)",
+			matchers: []*labels.Matcher{labels.MustNewMatcher(labels.MatchEqual, "id", "1")},
+			want:     `(up{id="1"})`,
+		},
+		{
+			name:     "aggregation",
+			query:    "sum(up) by (job)",
+			matchers: []*labels.Matcher{labels.MustNewMatcher(labels.MatchEqual, "id", "1")},
+			want:     `sum by (job) (up{id="1"})`,
+		},
+		{
+			name:     "complex aggregation",
+			query:    `sum by (env) (rate(http_requests_total{status="200"}[5m]))`,
+			matchers: []*labels.Matcher{labels.MustNewMatcher(labels.MatchEqual, "id", "1")},
+			want:     `sum by (env) (rate(http_requests_total{id="1",status="200"}[5m]))`,
+		},
 	}
 
 	for _, tt := range tests {
@@ -91,7 +139,7 @@ func TestRewriteQuery(t *testing.T) {
 	}
 }
 
-func TestParseFilters(t *testing.T) {
+func TestRewriting_FilterParsing(t *testing.T) {
 	tests := []struct {
 		name    string
 		filters []string
@@ -142,9 +190,21 @@ func TestParseFilters(t *testing.T) {
 			}
 		})
 	}
+
+	// Test skipping __name__ (Rule 112)
+	t.Run("skipping __name__ label", func(t *testing.T) {
+		filters := []string{`__name__="up"`, `env="prod"`}
+		matchers, err := ParseFilters(filters)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(matchers) != 1 {
+			t.Errorf("expected 1 matcher (skipping __name__), got %d", len(matchers))
+		}
+	})
 }
 
-func TestNormalizeFilters(t *testing.T) {
+func TestRewriting_FilterNormalization(t *testing.T) {
 	tests := []struct {
 		name    string
 		filters []string
@@ -187,7 +247,15 @@ func TestNormalizeFilters(t *testing.T) {
 	}
 }
 
-func TestMatchLabels(t *testing.T) {
+func TestRewriting_MatchParams_Error(t *testing.T) {
+	ctx := context.Background()
+	_, err := RewriteMatchParams(ctx, []string{"invalid{"}, []*labels.Matcher{labels.MustNewMatcher(labels.MatchEqual, "a", "b")})
+	if err == nil {
+		t.Error("expected error for invalid match param")
+	}
+}
+
+func TestRewriting_LabelMatching(t *testing.T) {
 	tests := []struct {
 		name     string
 		labels   map[string]string

@@ -10,6 +10,8 @@ import (
 
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/clientcredentials"
+
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
 
 // AuthType defines the supported authentication methods for upstream services.
@@ -86,28 +88,50 @@ func (a *AuthConfig) Validate() error {
 // NewAuthTransport creates an http.RoundTripper that injects authentication
 // into every outgoing request. Returns nil for AuthTypeNone (callers
 // should use http.DefaultTransport in that case).
-func NewAuthTransport(cfg AuthConfig) (http.RoundTripper, error) {
+func NewAuthTransport(cfg AuthConfig, skipVerify bool) (http.RoundTripper, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
 
-	base := http.DefaultTransport
+	var base http.RoundTripper = http.DefaultTransport
+	if skipVerify {
+		base = &http.Transport{
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: true,
+			},
+		}
+	}
+
+	// Handle MTLS which provides its own transport
+	if cfg.Type == AuthTypeMTLS {
+		var err error
+		base, err = newMTLSTransport(cfg, skipVerify)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	otelBase := otelhttp.NewTransport(base)
 
 	switch cfg.Type {
-	case AuthTypeNone:
+	case AuthTypeNone, AuthTypeMTLS:
+		// If we created a custom transport (SkipVerify or MTLS), return it even without headers
+		if skipVerify || cfg.Type == AuthTypeMTLS {
+			return otelBase, nil
+		}
 		return nil, nil
 
 	case AuthTypeBasic:
 		creds := base64.StdEncoding.EncodeToString([]byte(cfg.Username + ":" + cfg.Password))
 		return &headerTransport{
-			base:        base,
+			base:        otelBase,
 			headerName:  "Authorization",
 			headerValue: "Basic " + creds,
 		}, nil
 
 	case AuthTypeBearer:
 		return &headerTransport{
-			base:        base,
+			base:        otelBase,
 			headerName:  "Authorization",
 			headerValue: "Bearer " + cfg.Token,
 		}, nil
@@ -122,7 +146,7 @@ func NewAuthTransport(cfg AuthConfig) (http.RoundTripper, error) {
 		// oauth2.Transport handles token caching and refresh automatically.
 		return &oauth2.Transport{
 			Source: oauthCfg.TokenSource(oauth2.NoContext),
-			Base:   base,
+			Base:   otelBase,
 		}, nil
 
 	case AuthTypeAPIKey:
@@ -131,13 +155,10 @@ func NewAuthTransport(cfg AuthConfig) (http.RoundTripper, error) {
 			headerName = "X-API-Key"
 		}
 		return &headerTransport{
-			base:        base,
+			base:        otelBase,
 			headerName:  headerName,
 			headerValue: cfg.APIKey,
 		}, nil
-
-	case AuthTypeMTLS:
-		return newMTLSTransport(cfg)
 
 	default:
 		return nil, fmt.Errorf("unsupported auth type: %q", cfg.Type)
@@ -145,14 +166,15 @@ func NewAuthTransport(cfg AuthConfig) (http.RoundTripper, error) {
 }
 
 // newMTLSTransport creates an http.RoundTripper with client certificate authentication.
-func newMTLSTransport(cfg AuthConfig) (http.RoundTripper, error) {
+func newMTLSTransport(cfg AuthConfig, skipVerify bool) (http.RoundTripper, error) {
 	cert, err := tls.LoadX509KeyPair(cfg.CertFile, cfg.KeyFile)
 	if err != nil {
 		return nil, fmt.Errorf("loading client certificate: %w", err)
 	}
 
 	tlsCfg := &tls.Config{
-		Certificates: []tls.Certificate{cert},
+		Certificates:       []tls.Certificate{cert},
+		InsecureSkipVerify: skipVerify,
 	}
 
 	// Optional: load CA cert for server verification

@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"strconv"
 	"time"
 
@@ -19,7 +20,7 @@ type Metrics struct {
 	upstreamTotal    metric.Int64Counter
 	upstreamDuration metric.Float64Histogram
 	bundleRebuilds   metric.Int64Counter
-	activeTenants    metric.Int64UpDownCounter
+	activeTenants    metric.Float64Gauge
 
 	// Fan-Out Concurrency Saturation
 	fanoutActive  metric.Int64UpDownCounter
@@ -88,7 +89,7 @@ func NewMetrics() (*Metrics, error) {
 		return nil, err
 	}
 
-	m.activeTenants, err = meter.Int64UpDownCounter("heimdall_active_tenants",
+	m.activeTenants, err = meter.Float64Gauge("heimdall_active_tenants",
 		metric.WithDescription("Number of active tenants"),
 	)
 	if err != nil {
@@ -138,7 +139,7 @@ func MetricsMiddleware(m *Metrics) gin.HandlerFunc {
 		method := c.Request.Method
 		path := c.FullPath()
 		if path == "" {
-			path = c.Request.URL.Path
+			path = "not_found"
 		}
 
 		attrs := metric.WithAttributes(
@@ -149,5 +150,19 @@ func MetricsMiddleware(m *Metrics) gin.HandlerFunc {
 
 		m.requestsTotal.Add(c.Request.Context(), 1, attrs)
 		m.requestDuration.Record(c.Request.Context(), duration, attrs)
+	}
+}
+
+// RecordBundleRebuild increments the bundle rebuild counter (Rule 235).
+func (m *Metrics) RecordBundleRebuild(ctx context.Context) {
+	if m != nil && m.bundleRebuilds != nil {
+		m.bundleRebuilds.Add(ctx, 1)
+	}
+}
+
+// UpdateActiveTenants sets the active tenants gauge (Rule 234).
+func (m *Metrics) UpdateActiveTenants(ctx context.Context, count int64) {
+	if m != nil && m.activeTenants != nil {
+		m.activeTenants.Record(ctx, float64(count))
 	}
 }

@@ -16,11 +16,13 @@ func TestValidate_AllFieldsSet(t *testing.T) {
 				WriteTimeout: 30 * time.Second,
 				IdleTimeout:  120 * time.Second,
 			},
-			Bundle: ListenerConfig{Addr: ":9092"},
+			Bundle:   ListenerConfig{Addr: ":9092"},
+			LogLevel: "info",
 		},
 		Mimir: MimirConfig{
-			URL:     "http://mimir:8080",
-			Timeout: 30 * time.Second,
+			URL:                "http://mimir:8080",
+			Timeout:            30 * time.Second,
+			InsecureSkipVerify: false,
 		},
 		JWT: JWTConfig{
 			JWKSURL:     "http://jwks.example.com/.well-known/jwks.json",
@@ -29,9 +31,10 @@ func TestValidate_AllFieldsSet(t *testing.T) {
 			GroupsClaim: "groups",
 		},
 		OPA: OPAConfig{
-			URL:        "http://opa:8181",
-			PolicyPath: "v1/data/proxy/authz",
-			Timeout:    5 * time.Second,
+			URL:                "http://opa:8181",
+			PolicyPath:         "v1/data/proxy/authz",
+			Timeout:            5 * time.Second,
+			InsecureSkipVerify: false,
 		},
 		Database: DatabaseConfig{
 			Driver:          "sqlite",
@@ -56,7 +59,7 @@ func TestValidate_CLIOnlyWithoutJWTOPA(t *testing.T) {
 	// CLI commands (tenant, policy, migrate) only need basic config.
 	// Validate() should pass without JWT/OPA fields.
 	cfg := &Config{
-		Server:   ServerConfig{Main: ListenerConfig{Addr: ":9091"}},
+		Server:   ServerConfig{Main: ListenerConfig{Addr: ":9091"}, LogLevel: "info"},
 		Mimir:    MimirConfig{URL: "http://mimir:8080"},
 		Database: DatabaseConfig{DSN: "test.db"},
 		FanOut:   FanOutConfig{MaxConcurrency: 10},
@@ -215,7 +218,7 @@ server:
 // validConfig returns a fully populated Config for mutations.
 func validConfig() *Config {
 	return &Config{
-		Server:   ServerConfig{Main: ListenerConfig{Addr: ":9091"}, Bundle: ListenerConfig{Addr: ":9092"}},
+		Server:   ServerConfig{Main: ListenerConfig{Addr: ":9091"}, Bundle: ListenerConfig{Addr: ":9092"}, LogLevel: "info"},
 		Mimir:    MimirConfig{URL: "http://mimir:8080"},
 		JWT:      JWTConfig{JWKSURL: "http://jwks.example.com/.well-known/jwks.json", Issuer: "test", Audience: "test"},
 		OPA:      OPAConfig{URL: "http://opa:8181"},

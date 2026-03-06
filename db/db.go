@@ -288,6 +288,14 @@ func validatePolicy(p *Policy) error {
 	if len(scope.Tenants) == 0 {
 		return fmt.Errorf("scope.tenants must not be empty")
 	}
+	if len(scope.Resources) == 0 {
+		return fmt.Errorf("scope.resources must not be empty")
+	}
+	for _, res := range scope.Resources {
+		if res != "metrics" && res != "traces" && res != "logs" && res != "*" {
+			return fmt.Errorf("resource must be 'metrics', 'traces', 'logs', or '*', got %q", res)
+		}
+	}
 
 	// Validate filters JSON (must be valid JSON array)
 	var filters []string

@@ -1,0 +1,54 @@
+target: all,alertmanager,overrides-exporter
+
+multitenancy_enabled: true
+tenant_federation:
+  enabled: true
+
+blocks_storage:
+  backend: filesystem
+  bucket_store:
+    sync_dir: /var/mimir/tsdb-sync
+  filesystem:
+    dir: /var/mimir/data/tsdb
+  tsdb:
+    dir: /var/mimir/tsdb
+    wal_compression_enabled: true
+
+compactor:
+  data_dir: /var/mimir/compactor
+  sharding_ring:
+    kvstore:
+      store: memberlist
+
+distributor:
+  ring:
+    instance_addr: 127.0.0.1
+    kvstore:
+      store: memberlist
+
+ingester:
+  ring:
+    instance_addr: 127.0.0.1
+    kvstore:
+      store: memberlist
+    replication_factor: 1
+
+server:
+  http_listen_port: 9009
+  grpc_listen_port: 9095
+
+store_gateway:
+  sharding_ring:
+    replication_factor: 1
+
+querier:
+  max_concurrent: 16
+
+ruler:
+  rule_path: /var/mimir/ruler
+  alertmanager_url: http://127.0.0.1:8080/alertmanager
+  tenant_federation:
+    enabled: true
+  ring:
+    kvstore:
+      store: memberlist

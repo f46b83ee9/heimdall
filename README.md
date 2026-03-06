@@ -13,47 +13,48 @@ Heimdall sits between your users and Mimir, ensuring every request is:
 3. **Rewritten** — PromQL queries get label matchers injected from policy filters (e.g. `env="prod"`)
 4. **Federated** — Multi-tenant queries use Mimir's native federation (`X-Scope-OrgID: acme|globex`)
 
+### System Architecture & Request Flow
+
+Heimdall manages policy synchronization in the background while processing active requests.
+
 ```mermaid
 sequenceDiagram
+    autonumber
     participant Client
-    participant Handler as Heimdall Handler
+    participant Admin as Admin/CLI
+    participant DB as SQL Database
+    participant BS as Bundle Server (Heimdall)
     participant OPA as OPA Engine
     participant Mimir as Upstream Mimir
-    participant DB as SQL (Postgres/SQLite)
 
-    Note over Handler: [1] Middleware & Tracing Entry
-    Client->>Handler: Request (JWT + X-Scope-OrgID)
+    Note over Admin, BS: [Background] Policy Synchronization
+    Admin->>DB: create tenant/policy
+    BS->>DB: Listen/Poll (1s)
+    DB-->>BS: change detected
+    BS->>DB: Fetch state
+    DB-->>BS: tenants + policies
+    BS->>BS: Rebuild tar.gz (in-memory)
+    OPA->>BS: GET /bundles/bundle.tar.gz (polling)
+    BS-->>OPA: tar.gz payload
+    Note over OPA: Policy Update Applied
+
+    Note over Client, Mimir: [Active] Request Processing
+    Client->>BS: Request (JWT + X-Scope-OrgID)
+    BS->>BS: Validate JWT & Resolve Identity
     
-    Note over Handler: [2] Identity & Tenant Resolution
-    Handler->>Handler: Validate JWT (Signature, Exp, Iss, Aud)
-    Handler->>Handler: Extract sub (user_id) & groups
-
-    loop [3] OPA Authorization Loop (Once per tenant)
-        Handler->>OPA: input: {user_id, groups, tenant_id, action}
-        OPA-->>Handler: {allow, effective_filters, accessible_tenants}
+    loop Per Tenant
+        BS->>OPA: Evaluate {user, groups, tenant, action}
+        OPA-->>BS: {allow, effective_filters}
     end
 
-    Note over Handler: [4] Authorization Check
-    alt Any Deny Matches OR No Allow Matches
-        Handler-->>Client: 403 Forbidden (JSON Envelope)
-    else Authorized
-        Note over Handler: [5] Fan-Out Grouping & AST Rewrite
-        Handler->>Handler: Group tenants by identical filter signatures
-
-        Note over Handler: [6] Upstream Dispatch (Parallel)
-        par Group A (Tenant 1|Tenant 2)
-            Handler->>Mimir: X-Scope-OrgID: T1|T2 + Rewritten Query
-            Mimir-->>Handler: Result A
-        and Group B (Tenant 3)
-            Handler->>Mimir: X-Scope-OrgID: T3 + Rewritten Query
-            Mimir-->>Handler: Result B
-        end
-
-        Note over Handler: [7] Response Handling
-        Handler->>Handler: Deterministic Lexicographical Merge
-        
-        Note over Handler: [8] Client Response
-        Handler-->>Client: 200 OK (Merged JSON)
+    alt Authorized
+        BS->>BS: PromQL Rewrite (Inject Filters)
+        BS->>Mimir: Parallel Fan-out (Rewritten Queries)
+        Mimir-->>BS: HTTP 200 (Sub-results)
+        BS->>BS: Lexicographical Merge
+        BS-->>Client: Final Merged JSON
+    else Forbidden
+        BS-->>Client: 403 Forbidden
     end
 ```
 
@@ -81,30 +82,21 @@ docker build -t heimdall .
 
 ### Configuration
 
-Create a `config.yaml`:
+Create a `config.yaml` (see [config.example.yaml](config.example.yaml) for a fully documented version):
 
 ```yaml
 server:
   main:
     addr: ":9091"              # Proxy API
-    # tls:                     # Optional: enable HTTPS for proxy
-    #   cert_file: "/etc/heimdall/tls/server.crt"
-    #   key_file: "/etc/heimdall/tls/server.key"
-    #   client_ca_file: "/etc/heimdall/tls/ca.crt"  # Optional: enables mTLS
   bundle:
     addr: ":9092"              # OPA bundle server
-    # tls:                     # Optional: enable HTTPS for bundle server
-    #   cert_file: "/etc/heimdall/tls/bundle.crt"
-    #   key_file: "/etc/heimdall/tls/bundle.key"
+  log_level: "info"            # debug, info, warn, error
 
 mimir:
-  url: "http://mimir:8080"    # Default fallback URL for Monolithic deployment
-  # read_url: "http://mimir-query-frontend:8080" # Optional: Override for Microservices read path
-  # write_url: "http://mimir-distributor:8080"   # Optional: Override for Microservices write path
-  # ruler_url: "http://mimir-ruler:8080"         # Optional: Override for Microservices ruler path
-  # alertmanager_url: "http://mimir-alertmanager:8080" # Optional: Override for Microservices alertmanager path
+  url: "http://mimir:8080"
+  insecure_skip_verify: false  # TLS toggle
   auth:
-    type: "bearer"            # Supports: basic, bearer, oauth2, api_key, mtls
+    type: "bearer"
     token: "your-mimir-token"
 
 jwt:
@@ -114,16 +106,18 @@ jwt:
 
 opa:
   url: "http://opa:8181"
+  insecure_skip_verify: false
 
 database:
-  driver: "sqlite"  # Can be "postgres", "sqlite", "mysql", "sqlserver"
-  dsn: "file::memory:?cache=shared" # e.g. "heimdall.db" or "postgres://user:pass@localhost:5432/heimdall?sslmode=disable"
+  driver: "sqlite"
+  dsn: "heimdall.db"
 
 fanout:
   max_concurrency: 10
 
 telemetry:
   enabled: false
+  insecure_skip_verify: false
 ```
 
 All configuration can be overridden with environment variables using the `HEIMDALL_` prefix (e.g. `HEIMDALL_DATABASE_DSN`).
@@ -167,117 +161,97 @@ bundles:
 ./heimdall tenant create acme "Acme Corp" --config=config.yaml
 ./heimdall tenant create globex "Globex Inc" --config=config.yaml
 
-# Create a policy (allow alice to read acme with env="prod" filter)
+# Create a policy (allow alice to read acme metrics with env="prod" filter)
 ./heimdall policy create --config=config.yaml \
   --name="allow-alice-read-acme" \
   --effect=allow \
-  --subjects='[{"type":"user","id":"alice"}]' \
+  --subjects='[{"type":"user","id":"alice@acme.com"}]' \
   --actions='["read"]' \
-  --scope='{"tenants":["acme"]}' \
+  --scope='{"tenants":["acme"], "resources":["metrics"]}' \
   --filters='["env=\"prod\""]'
+
+# Batch create policies from a JSON file
+./heimdall policy create policies.json --config=config.yaml
+
+# Batch create policies from stdin
+cat policies.json | ./heimdall policy create - --config=config.yaml
 ```
 
 ## Observability & Instrumentation
 
-Heimdall has built-in [OpenTelemetry](https://opentelemetry.io/) distributed tracing. When enabled, every request generates spans for the full pipeline: JWT validation → OPA evaluation → PromQL rewriting → Mimir upstream calls → response merging.
+Heimdall is designed for production visibility, with native support for structured logging, distributed tracing, and Prometheus metrics.
 
-### Enable Tracing
+### Structured Logging
 
-Add to your `config.yaml`:
+Heimdall uses `slog` for structured, machine-readable logs.
+
+- **Trace Correlation**: When telemetry is enabled, every log line automatically includes `trace_id` and `span_id`.
+- **Log Level**: Configurable via `server.log_level` (e.g., `debug`, `info`, `warn`, `error`).
+
+Example:
+```bash
+INFO request started trace_id=abc123 span_id=def456 method=GET path=/api/v1/query
+DEBUG PromQL rewritten trace_id=abc123 span_id=789abc original="up" rewritten="up{env=\"prod\"}"
+```
+
+### Distributed Tracing (OpenTelemetry)
+
+Every request generates a trace across the entire lifecycle. Heimdall exports traces via **OTLP/gRPC**.
+
+#### Configuration
 
 ```yaml
 telemetry:
   enabled: true
-  otlp_endpoint: "localhost:4317"   # gRPC OTLP collector
-  service_name: "heimdall"          # appears in your trace viewer
+  service_name: "heimdall"
+  otlp_endpoint: "jaeger:4317"
+  insecure_skip_verify: false       # Set to true for self-signed OTLP collectors
+  auth:
+    type: "bearer"                  # Supports: none, basic, bearer, api_key, mtls
+    token: "..."
 ```
 
-Or via environment variables:
+#### Trace Structure (Spans)
 
-```bash
-export HEIMDALL_TELEMETRY_ENABLED=true
-export HEIMDALL_TELEMETRY_OTLP_ENDPOINT=localhost:4317
-```
+The following spans are generated for a standard multi-tenant query:
 
-### Backends
-
-Heimdall exports traces via **OTLP gRPC** (insecure), compatible with:
-
-| Backend | Receiver endpoint |
-|---------|------------------|
-| **Jaeger** | `localhost:4317` (OTLP native) |
-| **Grafana Tempo** | `localhost:4317` |
-| **OpenTelemetry Collector** | `localhost:4317` |
-| **Datadog Agent** | `localhost:4317` (with OTLP ingest enabled) |
-
-Example with Jaeger all-in-one:
-
-```bash
-docker run -d --name jaeger \
-  -p 16686:16686 \
-  -p 4317:4317 \
-  jaegertracing/all-in-one:latest
-
-# Then start Heimdall with telemetry.enabled=true
-# View traces at http://localhost:16686
-```
-
-### What Gets Traced
-
-Every request generates a trace with the following spans:
-
-```
-heimdall.request
-├── jwt.Validate              # Token parsing + signature check
-├── opa.Evaluate              # Per-tenant policy evaluation (one span per tenant)
-├── db.CreateTenant           # Database operations (if applicable)
-├── handler.RewriteQuery      # PromQL AST rewriting with filter injection
-├── fanout.Dispatch           # Parallel upstream requests to Mimir
-│   └── fanout.UpstreamCall   # Individual Mimir request per filter group
-└── handler.MergeResults      # Response merging for multi-tenant queries
-```
-
-### Context Propagation
-
-Heimdall propagates W3C `traceparent` headers to upstream Mimir calls, so traces link across services. Incoming `traceparent` headers are also respected, allowing end-to-end tracing from your client through Heimdall to Mimir.
-
-### Structured Logging
-
-All `slog` log lines include `trace_id` and `span_id` when telemetry is enabled, making it easy to correlate logs with traces:
-
-```
-INFO request started trace_id=abc123 span_id=def456 method=GET path=/api/v1/query
-INFO JWT validated trace_id=abc123 span_id=789abc user_id=alice groups_count=2
+```text
+Method Path                   # Root span (e.g., GET /api/v1/query)
+├── jwt.Validate              # JWT signature and claim validation
+├── fanout.EvaluateTenants    # Resolve tenants and fetch filters from OPA
+│   └── opa.Evaluate          # Per-tenant evaluation (parallel)
+├── rewrite.Query             # PromQL AST manipulation (filter injection)
+├── fanout.Dispatch           # Parallel fan-out to upstream Mimir
+│   └── fanout.DispatchSingle # Individual Mimir HTTP request
+├── filter.Rules/Alerts       # Response-mode label filtering
+└── db.Create/Get/List/Delete # Admin API database operations
 ```
 
 ### Prometheus Metrics
 
-Metrics are **always enabled** (even without tracing) and served at `GET :9092/metrics` (same port as the bundle server).
+Metrics are **always enabled** and served at `GET :9092/metrics`.
 
-Available metrics:
+| Metric | Type | Description |
+|--------|------|-------------|
+| `heimdall_requests_total` | Counter | Total HTTP requests (labels: `method`, `path`, `status`) |
+| `heimdall_request_duration_seconds` | Histogram | Request latency (labels: `method`, `path`, `status`) |
+| `heimdall_opa_evaluations_total` | Counter | Total OPA policy evaluations |
+| `heimdall_opa_evaluation_duration_seconds` | Histogram | OPA evaluation latency |
+| `heimdall_upstream_requests_total` | Counter | Total upstream Mimir requests |
+| `heimdall_upstream_request_duration_seconds` | Histogram | Upstream latency |
+| `heimdall_bundle_rebuilds_total` | Counter | OPA bundle rebuilds (background task) |
+| `heimdall_active_tenants` | Gauge | Number of active tenants in registry |
+| `heimdall_fanout_active_goroutines` | Gauge | Saturation: currently executing fan-out requests |
+| `heimdall_fanout_dropped_requests_total` | Counter | Requests rejected due to concurrency limits |
+| `heimdall_tenant_cache_hits_total` | Counter | Auto-resolution cache hits |
 
-| Metric | Type | Labels | Description |
-|--------|------|--------|-------------|
-| `heimdall_requests_total` | counter | method, path, status | Total HTTP requests |
-| `heimdall_request_duration_seconds` | histogram | method, path, status | Request latency |
-| `heimdall_opa_evaluations_total` | counter | — | OPA policy evaluations |
-| `heimdall_opa_evaluation_duration_seconds` | histogram | — | OPA evaluation latency |
-| `heimdall_upstream_requests_total` | counter | method, path, status | Upstream Mimir requests |
-| `heimdall_upstream_request_duration_seconds` | histogram | method, path, status | Upstream request latency |
-| `heimdall_bundle_rebuilds_total` | counter | — | OPA bundle rebuilds |
-| `heimdall_active_tenants` | gauge | — | Number of active tenants |
-| `heimdall_tenant_cache_hits_total` | counter | — | OPA Tenant auto-resolve read cache hits |
-| `heimdall_tenant_cache_misses_total` | counter | — | OPA Tenant auto-resolve read cache misses |
-| `heimdall_fanout_active_goroutines` | gauge | — | Number of active fan-out dispatch goroutines |
-| `heimdall_fanout_dropped_requests_total` | counter | — | Upstream requests declined due to backend concurrency limits |
-
-Scrape config for Prometheus:
+Scrape configuration for Prometheus:
 
 ```yaml
 scrape_configs:
-  - job_name: heimdall
+  - job_name: 'heimdall'
     static_configs:
-      - targets: ["heimdall:9092"]
+      - targets: ['heimdall:9092']
 ```
 
 ## Health Checks

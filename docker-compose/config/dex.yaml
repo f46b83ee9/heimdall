@@ -1,0 +1,33 @@
+issuer: http://localhost:5556/dex
+storage:
+  type: memory
+web:
+  http: 0.0.0.0:5556
+logger:
+  level: debug
+  format: text
+
+# Static configuration for testing
+staticClients:
+  - id: grafana
+    redirectURIs:
+      - 'http://localhost:3000/login/generic_oauth'
+    name: 'Grafana'
+    secret: ZXhhbXBsZS1hcHAtc2VjcmV0
+
+enablePasswordDB: true
+
+# The bcrypt hash is for "password"
+staticPasswords:
+  - email: "admin@example.com"
+    hash: "$2a$12$JomTeWfeZ74NKc4BPzaEruRmx7ZZypLRSZucmLhB/1.Yi1QllRWmi"
+    username: "admin"
+    userID: "admin"
+  - email: "alice@acme.com"
+    hash: "$2a$12$JomTeWfeZ74NKc4BPzaEruRmx7ZZypLRSZucmLhB/1.Yi1QllRWmi"
+    username: "alice"
+    userID: "alice"
+  - email: "bob@globex.com"
+    hash: "$2a$12$JomTeWfeZ74NKc4BPzaEruRmx7ZZypLRSZucmLhB/1.Yi1QllRWmi"
+    username: "bob"
+    userID: "bob"

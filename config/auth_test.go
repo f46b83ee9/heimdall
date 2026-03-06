@@ -15,6 +15,8 @@ import (
 	"os"
 	"testing"
 	"time"
+
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
 
 func TestAuthConfig_Validate(t *testing.T) {
@@ -58,7 +60,7 @@ func TestAuthConfig_Validate(t *testing.T) {
 }
 
 func TestNewAuthTransport_None(t *testing.T) {
-	tr, err := NewAuthTransport(AuthConfig{})
+	tr, err := NewAuthTransport(AuthConfig{}, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -73,7 +75,7 @@ func TestNewAuthTransport_Basic(t *testing.T) {
 		Username: "admin",
 		Password: "secret",
 	}
-	tr, err := NewAuthTransport(cfg)
+	tr, err := NewAuthTransport(cfg, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -104,7 +106,7 @@ func TestNewAuthTransport_Bearer(t *testing.T) {
 		Type:  AuthTypeBearer,
 		Token: "my-token-123",
 	}
-	tr, err := NewAuthTransport(cfg)
+	tr, err := NewAuthTransport(cfg, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -143,7 +145,7 @@ func TestNewAuthTransport_OAuth2(t *testing.T) {
 		TokenURL:     tokenServer.URL,
 		Scopes:       []string{"read"},
 	}
-	tr, err := NewAuthTransport(cfg)
+	tr, err := NewAuthTransport(cfg, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -168,7 +170,7 @@ func TestNewAuthTransport_OAuth2(t *testing.T) {
 }
 
 func TestNewAuthTransport_InvalidConfig(t *testing.T) {
-	_, err := NewAuthTransport(AuthConfig{Type: AuthTypeBasic}) // missing username/password
+	_, err := NewAuthTransport(AuthConfig{Type: AuthTypeBasic}, false) // missing username/password
 	if err == nil {
 		t.Error("expected error for invalid basic auth config")
 	}
@@ -179,7 +181,7 @@ func TestNewAuthTransport_APIKey_DefaultHeader(t *testing.T) {
 		Type:   AuthTypeAPIKey,
 		APIKey: "secret-key-42",
 	}
-	tr, err := NewAuthTransport(cfg)
+	tr, err := NewAuthTransport(cfg, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -209,7 +211,7 @@ func TestNewAuthTransport_APIKey_CustomHeader(t *testing.T) {
 		APIKey:       "custom-key",
 		APIKeyHeader: "X-Custom-Auth",
 	}
-	tr, err := NewAuthTransport(cfg)
+	tr, err := NewAuthTransport(cfg, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -243,7 +245,7 @@ func TestNewAuthTransport_MTLS(t *testing.T) {
 		CertFile: certFile,
 		KeyFile:  keyFile,
 	}
-	tr, err := NewAuthTransport(cfg)
+	tr, err := NewAuthTransport(cfg, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -258,7 +260,7 @@ func TestNewAuthTransport_MTLS_InvalidFiles(t *testing.T) {
 		CertFile: "/nonexistent/cert.pem",
 		KeyFile:  "/nonexistent/key.pem",
 	}
-	_, err := NewAuthTransport(cfg)
+	_, err := NewAuthTransport(cfg, false)
 	if err == nil {
 		t.Error("expected error for nonexistent cert files")
 	}
@@ -275,12 +277,30 @@ func TestNewAuthTransport_MTLS_WithCA(t *testing.T) {
 		KeyFile:  keyFile,
 		CAFile:   certFile,
 	}
-	tr, err := NewAuthTransport(cfg)
+	tr, err := NewAuthTransport(cfg, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if tr == nil {
 		t.Fatal("expected non-nil transport for mTLS with CA")
+	}
+}
+
+func TestNewAuthTransport_SkipVerify(t *testing.T) {
+	cfg := AuthConfig{Type: AuthTypeNone}
+	tr, err := NewAuthTransport(cfg, true)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if tr == nil {
+		t.Fatal("expected non-nil transport when skipVerify is true")
+	}
+
+	// Verify it's an otelhttp transport
+	_, ok := tr.(*otelhttp.Transport)
+	if !ok {
+		t.Errorf("expected *otelhttp.Transport, got %T", tr)
+		return
 	}
 }
 

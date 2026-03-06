@@ -1,166 +1,122 @@
 package handler
 
+// protects: Invariant[Authorization] - ForwardWrite and AuthorizeWrite must enforce OPA policies.
+// protects: Invariant[Availability] - Dynamic URL resolution must handle microservice topology.
+
 import (
 	"context"
-	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+
+	"github.com/f46b83ee9/heimdall/config"
 )
 
-func TestMergeResults_SingleResult(t *testing.T) {
-	input := []upstreamResult{
-		{GroupIndex: 0, Body: []byte(`{"status":"success","data":{"resultType":"vector","result":[{"metric":{"env":"prod"},"value":[1,"42"]}]}}`)},
-	}
-	got, err := mergeResults(input)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	// Single result should be returned as-is
-	if string(got) != string(input[0].Body) {
-		t.Errorf("expected unchanged body")
-	}
-}
+func TestAvailability_Mimir_URLResolution(t *testing.T) {
+	fe := NewFanOutEngine(nil, config.MimirConfig{
+		URL:             "http://global:8080",
+		WriteURL:        "http://write:8080",
+		ReadURL:         "http://read:8080",
+		RulerURL:        "http://ruler:8080",
+		AlertmanagerURL: "http://alert:8080",
+	}, config.FanOutConfig{}, nil, nil)
 
-func TestMergeResults_MultipleResults(t *testing.T) {
-	input := []upstreamResult{
-		{GroupIndex: 0, Body: []byte(`{"status":"success","data":{"resultType":"vector","result":[{"metric":{"tenant":"acme"},"value":[1,"1"]}]}}`)},
-		{GroupIndex: 1, Body: []byte(`{"status":"success","data":{"resultType":"vector","result":[{"metric":{"tenant":"globex"},"value":[1,"2"]}]}}`)},
-	}
-	got, err := mergeResults(input)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	tests := []struct {
+		action Action
+		path   string
+		want   string
+	}{
+		{ActionWrite, "/api/v1/push", "http://write:8080/api/v1/push"},
+		{ActionRead, "/api/v1/query", "http://read:8080/api/v1/query"},
+		{ActionRulesRead, "/api/v1/rules", "http://ruler:8080/api/v1/rules"},
+		{ActionRulesWrite, "/api/v1/rules", "http://ruler:8080/api/v1/rules"},
+		{ActionAlertsRead, "/alerts", "http://alert:8080/alerts"},
+		{ActionRead, "/path", "http://read:8080/path"},   // ReadURL override
+		{ActionWrite, "/push", "http://write:8080/push"}, // WriteURL override
 	}
 
-	var resp struct {
-		Status string `json:"status"`
-		Data   struct {
-			ResultType string            `json:"resultType"`
-			Result     []json.RawMessage `json:"result"`
-		} `json:"data"`
-	}
-	if err := json.Unmarshal(got, &resp); err != nil {
-		t.Fatalf("unmarshaling: %v", err)
-	}
-	if resp.Status != "success" {
-		t.Errorf("expected success, got %s", resp.Status)
-	}
-	if resp.Data.ResultType != "vector" {
-		t.Errorf("expected vector, got %s", resp.Data.ResultType)
-	}
-	if len(resp.Data.Result) != 2 {
-		t.Errorf("expected 2 results, got %d", len(resp.Data.Result))
-	}
-}
-
-func TestMergeResults_NonPromFormat(t *testing.T) {
-	input := []upstreamResult{
-		{GroupIndex: 0, Body: []byte(`not json`)},
-		{GroupIndex: 1, Body: []byte(`also not json`)},
-	}
-	got, err := mergeResults(input)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	// Should fall back to first result
-	if string(got) != "not json" {
-		t.Errorf("expected first body fallback, got %s", got)
-	}
-}
-
-func TestOPAClient_Evaluate_MockServer(t *testing.T) {
-	// Mock OPA server
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/v1/data/proxy/authz" {
-			t.Errorf("unexpected path: %s", r.URL.Path)
+	for _, tt := range tests {
+		got := fe.resolveUpstreamURL(tt.path, tt.action)
+		if got != tt.want {
+			t.Errorf("resolveUpstreamURL(%v, %v) = %q, want %q", tt.path, tt.action, got, tt.want)
 		}
+	}
 
-		var body map[string]interface{}
-		json.NewDecoder(r.Body).Decode(&body)
-
-		input, ok := body["input"].(map[string]interface{})
-		if !ok {
-			t.Fatal("expected input in request body")
+	t.Run("isResponseFilterAction Helper", func(t *testing.T) {
+		if !isResponseFilterAction(ActionRulesRead) {
+			t.Error("expected true for RulesRead")
 		}
-
-		userID := input["user_id"].(string)
-
-		// Simulate policy evaluation
-		allow := userID == "alice"
-		resp := map[string]interface{}{
-			"result": map[string]interface{}{
-				"allow":              allow,
-				"effective_filters":  []string{`env="prod"`},
-				"accessible_tenants": []string{"acme"},
-			},
-		}
-		json.NewEncoder(w).Encode(resp)
-	}))
-	defer server.Close()
-
-	client := NewOPAClient(server.URL, "v1/data/proxy/authz", 5e9, nil)
-
-	// Test allowed user
-	t.Run("allowed_user", func(t *testing.T) {
-		result, err := client.Evaluate(context.Background(), OPAInput{
-			UserID:   "alice",
-			Groups:   []string{"devs"},
-			TenantID: "acme",
-			Resource: "metrics",
-			Action:   "read",
-		})
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if !result.Allow {
-			t.Error("expected alice to be allowed")
-		}
-		if len(result.EffectiveFilters) != 1 {
-			t.Errorf("expected 1 filter, got %d", len(result.EffectiveFilters))
-		}
-	})
-
-	// Test denied user
-	t.Run("denied_user", func(t *testing.T) {
-		result, err := client.Evaluate(context.Background(), OPAInput{
-			UserID:   "bob",
-			Groups:   []string{"viewers"},
-			TenantID: "acme",
-			Resource: "metrics",
-			Action:   "read",
-		})
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if result.Allow {
-			t.Error("expected bob to be denied")
+		if isResponseFilterAction(ActionRead) {
+			t.Error("expected false for Read")
 		}
 	})
 }
 
-func TestOPAClient_Evaluate_ServerError(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusInternalServerError)
-		w.Write([]byte("internal error"))
-	}))
-	defer server.Close()
+func TestAuthorization_Mimir_AccessControl(t *testing.T) {
+	mockOPA := &MockOPA{Result: &OPAResult{Allow: true}}
+	fe := NewFanOutEngine(mockOPA, config.MimirConfig{}, config.FanOutConfig{}, nil, nil)
 
-	client := NewOPAClient(server.URL, "v1/data/proxy/authz", 5e9, nil)
-	_, err := client.Evaluate(context.Background(), OPAInput{UserID: "alice"})
-	if err == nil {
-		t.Fatal("expected error for 500 response")
-	}
-}
+	identity := &Identity{UserID: "alice"}
 
-func TestOPAClient_Evaluate_InvalidResponse(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("not json"))
-	}))
-	defer server.Close()
+	t.Run("AuthorizeWrite Single tenant allowed", func(t *testing.T) {
+		denied, err := fe.AuthorizeWrite(context.Background(), identity, []string{"t1"}, ActionWrite)
+		if err != nil || denied != "" {
+			t.Errorf("expected success, got %s, %v", denied, err)
+		}
+	})
 
-	client := NewOPAClient(server.URL, "v1/data/proxy/authz", 5e9, nil)
-	_, err := client.Evaluate(context.Background(), OPAInput{UserID: "alice"})
-	if err == nil {
-		t.Fatal("expected error for invalid JSON response")
-	}
+	t.Run("AuthorizeWrite One tenant denied", func(t *testing.T) {
+		mockOPA.Result = &OPAResult{Allow: false}
+		denied, err := fe.AuthorizeWrite(context.Background(), identity, []string{"t1", "t2"}, ActionWrite)
+		if err != nil || denied != "t1" {
+			t.Errorf("expected t1 denied, got %s, %v", denied, err)
+		}
+	})
+
+	t.Run("AuthorizeWrite OPA evaluation error", func(t *testing.T) {
+		mockOPA.Err = context.Canceled
+		_, err := fe.AuthorizeWrite(context.Background(), identity, []string{"t1"}, ActionWrite)
+		if err == nil {
+			t.Error("expected error")
+		}
+	})
+
+	t.Run("ForwardWrite Host unreachable", func(t *testing.T) {
+		feBad := NewFanOutEngine(nil, config.MimirConfig{URL: "http://mono:8080"}, config.FanOutConfig{}, nil, nil)
+		req := httptest.NewRequest("POST", "/api/v1/push", nil)
+		_, _, err := feBad.ForwardWrite(context.Background(), []string{"t1"}, req)
+		if err == nil {
+			t.Error("expected network error")
+		}
+	})
+
+	t.Run("ForwardWrite Query parameter handling", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.RawQuery != "a=b" {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+		}))
+		defer server.Close()
+
+		feOK := NewFanOutEngine(nil, config.MimirConfig{URL: server.URL}, config.FanOutConfig{}, server.Client().Transport, nil)
+		req := httptest.NewRequest("POST", "/api/v1/push?a=b", nil)
+		_, status, err := feOK.ForwardWrite(context.Background(), []string{"t1"}, req)
+		if err != nil || status != http.StatusOK {
+			t.Errorf("failed: status %d, err %v", status, err)
+		}
+	})
+
+	t.Run("ForwardWrite Upstream read error", func(t *testing.T) {
+		fe := &FanOutEngine{
+			httpClient: &http.Client{Transport: &mockErrorBodyTransport{}},
+		}
+		req := httptest.NewRequest("POST", "/push", nil)
+		_, _, err := fe.ForwardWrite(context.Background(), []string{"t1"}, req)
+		if err == nil || !strings.Contains(err.Error(), "reading upstream response") {
+			t.Errorf("expected read error, got %v", err)
+		}
+	})
 }

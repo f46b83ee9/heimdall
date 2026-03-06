@@ -61,8 +61,7 @@ Do NOT introduce routing, models, flags, or abstractions for them.
 
 8. Identity originates exclusively from validated JWT.
 9. Extract only:
-
-   * `sub` → `user_id`
+   * configured user_id claim → `user_id`
    * configured groups claim → `groups`
 10. Users and groups are NEVER persisted.
 11. No identity caching across requests.
@@ -275,12 +274,21 @@ RespondError(c *gin.Context, status int, code, message string)
 Must be:
 
 * Mutex-protected
-* Atomic (temp → fsync → rename)
+* Atomic (build into buffer → swap pointer)
 * Idempotent
 * Blocking only for triggering writes
 * Context-aware
 * Traced
 * Panic-safe
+
+The bundle is **served entirely from memory**.
+
+* No temporary files.
+* No fsync.
+* No filesystem rename.
+* The active bundle is held as a `[]byte` behind a pointer guarded by the rebuild mutex.
+* Readers access the current pointer without blocking writers beyond the pointer swap.
+* No disk state is ever consulted at serve time.
 
 No concurrent rebuild races allowed.
 
@@ -296,7 +304,7 @@ Heimdall depends on:
 * GORM
 * Gin
 
-The correctness of these libraries is NOT Heimdall’s responsibility.
+The correctness of these libraries is NOT Heimdall's responsibility.
 
 ## DO NOT WRITE TESTS FOR:
 
@@ -389,6 +397,8 @@ DO NOT:
 * Partially succeed
 * Test third-party library correctness
 * Inflate coverage with trivial assertions
+* Write bundle bytes to disk
+* Read bundle from filesystem at serve time
 
 ---
 

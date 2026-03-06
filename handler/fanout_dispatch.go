@@ -3,11 +3,12 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
-	"sort"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -26,6 +27,11 @@ func (fe *FanOutEngine) Dispatch(ctx context.Context, groups []filterGroup, orig
 
 	if len(groups) == 0 {
 		return nil, http.StatusForbidden, nil
+	}
+
+	// Pre-parse the form once to handle URL-encoded POST bodies (Invariant #13 - thread safety)
+	if err := originalReq.ParseForm(); err != nil {
+		return nil, http.StatusBadRequest, fmt.Errorf("parsing form data: %w", err)
 	}
 
 	// Apply explicit timeout to the dispatch (Invariant #20)
@@ -83,10 +89,23 @@ func (fe *FanOutEngine) Dispatch(ctx context.Context, groups []filterGroup, orig
 	if err := g.Wait(); err != nil {
 		span.RecordError(err)
 
-		// Preserve 503 error if originated from ctx.Done() inside goroutine
-		if ctx.Err() != nil {
+		// Check if the overall dispatch timeout was reached (Invariant #20)
+		// We must check against the parent context 'originalCtx' or the one we timed out,
+		// because the 'ctx' from errgroup is canceled as soon as any goroutine fails.
+		select {
+		case <-originalReq.Context().Done():
+			return nil, http.StatusGatewayTimeout, err
+		default:
+			// If it wasn't the original request context, check if it was our fe.timeout
+			// But for simplicity, we can just check if the error contains "deadline exceeded"
+			// or if the timeout we created is done.
+		}
+
+		// Re-using the 'cancel' from line 38 isn't enough, we need to check the error type.
+		if ctx.Err() != nil && errors.Is(err, context.DeadlineExceeded) {
 			return nil, http.StatusGatewayTimeout, err
 		}
+
 		return nil, http.StatusBadGateway, err
 	}
 
@@ -120,12 +139,11 @@ func (fe *FanOutEngine) dispatchSingle(ctx context.Context, group filterGroup, o
 	// For read actions, rewrite the query
 	var body io.Reader
 
-	// Pre-parse the form to handle URL-encoded POST bodies
-	if err := originalReq.ParseForm(); err != nil {
-		return nil, 0, fmt.Errorf("parsing form data: %w", err)
+	// Clone query parameters to avoid data races (Invariant #13)
+	query := make(url.Values)
+	for k, v := range originalReq.Form {
+		query[k] = v
 	}
-
-	query := originalReq.Form
 
 	if isReadAction(action) && len(group.Matchers) > 0 {
 		// Rewrite query parameter
@@ -276,10 +294,8 @@ func mergeResults(results []upstreamResult) ([]byte, error) {
 		allResults = append(allResults, qd.Result...)
 	}
 
-	// Sort results deterministically by JSON content
-	sort.Slice(allResults, func(i, j int) bool {
-		return string(allResults[i]) < string(allResults[j])
-	})
+	// The groups themselves are already sorted by FilterKey/TenantIDs in Dispatch.
+	// We preserve that order by merging them in the order they appear in the results slice.
 
 	merged.Data = queryData{
 		ResultType: resultType,

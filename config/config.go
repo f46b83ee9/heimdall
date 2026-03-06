@@ -23,8 +23,9 @@ type Config struct {
 
 // ServerConfig holds HTTP server settings.
 type ServerConfig struct {
-	Main   ListenerConfig `mapstructure:"main" json:"main" yaml:"main"`
-	Bundle ListenerConfig `mapstructure:"bundle" json:"bundle" yaml:"bundle"`
+	Main     ListenerConfig `mapstructure:"main" json:"main" yaml:"main"`
+	Bundle   ListenerConfig `mapstructure:"bundle" json:"bundle" yaml:"bundle"`
+	LogLevel string         `mapstructure:"log_level" json:"log_level" yaml:"log_level"`
 }
 
 // ListenerConfig holds settings for a single HTTP(S) listener.
@@ -50,13 +51,14 @@ func (t *ServerTLSConfig) Enabled() bool {
 
 // MimirConfig holds upstream Mimir settings.
 type MimirConfig struct {
-	URL             string        `mapstructure:"url" json:"url" yaml:"url"`
-	ReadURL         string        `mapstructure:"read_url" json:"read_url" yaml:"read_url"`
-	WriteURL        string        `mapstructure:"write_url" json:"write_url" yaml:"write_url"`
-	RulerURL        string        `mapstructure:"ruler_url" json:"ruler_url" yaml:"ruler_url"`
-	AlertmanagerURL string        `mapstructure:"alertmanager_url" json:"alertmanager_url" yaml:"alertmanager_url"`
-	Timeout         time.Duration `mapstructure:"timeout" json:"timeout" yaml:"timeout"`
-	Auth            AuthConfig    `mapstructure:"auth" json:"auth" yaml:"auth"`
+	URL                string        `mapstructure:"url" json:"url" yaml:"url"`
+	ReadURL            string        `mapstructure:"read_url" json:"read_url" yaml:"read_url"`
+	WriteURL           string        `mapstructure:"write_url" json:"write_url" yaml:"write_url"`
+	RulerURL           string        `mapstructure:"ruler_url" json:"ruler_url" yaml:"ruler_url"`
+	AlertmanagerURL    string        `mapstructure:"alertmanager_url" json:"alertmanager_url" yaml:"alertmanager_url"`
+	Timeout            time.Duration `mapstructure:"timeout" json:"timeout" yaml:"timeout"`
+	InsecureSkipVerify bool          `mapstructure:"insecure_skip_verify" json:"insecure_skip_verify" yaml:"insecure_skip_verify"`
+	Auth               AuthConfig    `mapstructure:"auth" json:"auth" yaml:"auth"`
 }
 
 // JWTConfig holds JWT validation settings.
@@ -65,14 +67,16 @@ type JWTConfig struct {
 	Issuer      string `mapstructure:"issuer" json:"issuer" yaml:"issuer"`
 	Audience    string `mapstructure:"audience" json:"audience" yaml:"audience"`
 	GroupsClaim string `mapstructure:"groups_claim" json:"groups_claim" yaml:"groups_claim"`
+	UserIDClaim string `mapstructure:"user_id_claim" json:"user_id_claim" yaml:"user_id_claim"`
 }
 
 // OPAConfig holds Open Policy Agent settings.
 type OPAConfig struct {
-	URL        string        `mapstructure:"url" json:"url" yaml:"url"`
-	PolicyPath string        `mapstructure:"policy_path" json:"policy_path" yaml:"policy_path"`
-	Timeout    time.Duration `mapstructure:"timeout" json:"timeout" yaml:"timeout"`
-	Auth       AuthConfig    `mapstructure:"auth" json:"auth" yaml:"auth"`
+	URL                string        `mapstructure:"url" json:"url" yaml:"url"`
+	PolicyPath         string        `mapstructure:"policy_path" json:"policy_path" yaml:"policy_path"`
+	Timeout            time.Duration `mapstructure:"timeout" json:"timeout" yaml:"timeout"`
+	InsecureSkipVerify bool          `mapstructure:"insecure_skip_verify" json:"insecure_skip_verify" yaml:"insecure_skip_verify"`
+	Auth               AuthConfig    `mapstructure:"auth" json:"auth" yaml:"auth"`
 }
 
 // DatabaseConfig holds database connection settings.
@@ -90,9 +94,11 @@ type FanOutConfig struct {
 
 // TelemetryConfig holds OpenTelemetry settings.
 type TelemetryConfig struct {
-	Enabled      bool   `mapstructure:"enabled" json:"enabled" yaml:"enabled"`
-	OTLPEndpoint string `mapstructure:"otlp_endpoint" json:"otlp_endpoint" yaml:"otlp_endpoint"`
-	ServiceName  string `mapstructure:"service_name" json:"service_name" yaml:"service_name"`
+	Enabled            bool       `mapstructure:"enabled" json:"enabled" yaml:"enabled"`
+	OTLPEndpoint       string     `mapstructure:"otlp_endpoint" json:"otlp_endpoint" yaml:"otlp_endpoint"`
+	ServiceName        string     `mapstructure:"service_name" json:"service_name" yaml:"service_name"`
+	InsecureSkipVerify bool       `mapstructure:"insecure_skip_verify" json:"insecure_skip_verify" yaml:"insecure_skip_verify"`
+	Auth               AuthConfig `mapstructure:"auth" json:"auth" yaml:"auth"`
 }
 
 // Load reads configuration from the given path and validates all required fields.
@@ -112,8 +118,10 @@ func Load(path string) (*Config, error) {
 	v.SetDefault("server.main.write_timeout", 30*time.Second)
 	v.SetDefault("server.main.idle_timeout", 120*time.Second)
 	v.SetDefault("server.bundle.addr", ":9092")
+	v.SetDefault("server.log_level", "info")
 	v.SetDefault("mimir.timeout", 30*time.Second)
 	v.SetDefault("jwt.groups_claim", "groups")
+	v.SetDefault("jwt.user_id_claim", "sub")
 	v.SetDefault("opa.policy_path", "v1/data/proxy/authz")
 	v.SetDefault("opa.timeout", 5*time.Second)
 	v.SetDefault("database.driver", "sqlite")
@@ -202,7 +210,10 @@ func (c *Config) ValidateServe() error {
 		errs = append(errs, fmt.Sprintf("mimir.auth: %v", err))
 	}
 	if err := c.OPA.Auth.Validate(); err != nil {
-		errs = append(errs, fmt.Sprintf("opa.auth: %v", err))
+		errs = append(errs, fmt.Errorf("opa.auth: %w", err).Error())
+	}
+	if err := c.Telemetry.Auth.Validate(); err != nil {
+		errs = append(errs, fmt.Errorf("telemetry.auth: %w", err).Error())
 	}
 
 	// Server TLS validation

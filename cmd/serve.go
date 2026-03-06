@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -47,13 +48,32 @@ func runServe() error {
 		return fmt.Errorf("configuration validation failed: %w", err)
 	}
 
+	// Set default logger with OTel support (AGENTS.md Rule 222)
+	var level slog.Level
+	switch strings.ToLower(cfg.Server.LogLevel) {
+	case "debug":
+		level = slog.LevelDebug
+	case "info":
+		level = slog.LevelInfo
+	case "warn":
+		level = slog.LevelWarn
+	case "error":
+		level = slog.LevelError
+	default:
+		level = slog.LevelInfo
+	}
+
+	slog.SetDefault(slog.New(heimdallOtel.NewOTelHandler(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		Level: level,
+	}))))
+
 	slog.Info("configuration loaded", "config_file", cfgFile)
 
 	// 2. Initialize OpenTelemetry
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	otelProvider, err := heimdallOtel.Init(ctx, cfg.Telemetry.ServiceName, cfg.Telemetry.OTLPEndpoint, cfg.Telemetry.Enabled)
+	otelProvider, err := heimdallOtel.Init(ctx, cfg.Telemetry)
 	if err != nil {
 		return fmt.Errorf("OpenTelemetry initialization failed: %w", err)
 	}
@@ -82,8 +102,13 @@ func runServe() error {
 
 	slog.Info("database connected and migrated", "driver", cfg.Database.Driver)
 
-	// 5. Initialize and start bundle server
-	bundleServer := db.NewBundleServer(store)
+	// 5. Initialize metrics (early init for other components)
+	metrics, err := handler.NewMetrics()
+	if err != nil {
+		return fmt.Errorf("initializing metrics: %w", err)
+	}
+
+	bundleServer := db.NewBundleServer(store, metrics)
 
 	// Initial bundle build
 	if err := bundleServer.Rebuild(ctx); err != nil {
@@ -92,7 +117,7 @@ func runServe() error {
 
 	// Start change detection
 	if cfg.Database.Driver == "postgres" {
-		if err := bundleServer.StartListenNotify(ctx); err != nil {
+		if err := bundleServer.StartListenNotify(ctx, cfg.Database.RefreshInterval); err != nil {
 			slog.Warn("LISTEN/NOTIFY setup failed, falling back to polling", "error", err)
 			bundleServer.StartPolling(ctx, cfg.Database.RefreshInterval)
 		}
@@ -150,20 +175,16 @@ func runServe() error {
 	}()
 
 	// 6. Initialize OPA client with optional auth transport
-	opaTransport, err := config.NewAuthTransport(cfg.OPA.Auth)
+	opaTransport, err := config.NewAuthTransport(cfg.OPA.Auth, cfg.OPA.InsecureSkipVerify)
 	if err != nil {
 		return fmt.Errorf("initializing OPA auth: %w", err)
 	}
-	opaClient := handler.NewOPAClient(cfg.OPA.URL, cfg.OPA.PolicyPath, cfg.OPA.Timeout, opaTransport)
+	opaClient := handler.NewOPAClient(cfg.OPA.URL, cfg.OPA.PolicyPath, cfg.OPA.Timeout, opaTransport, metrics)
 
-	// 7. Initialize metrics
-	metrics, err := handler.NewMetrics()
-	if err != nil {
-		return fmt.Errorf("initializing metrics: %w", err)
-	}
+	slog.Info("metrics initialized")
 
 	// 8. Initialize fan-out engine with optional upstream auth transport
-	mimirTransport, err := config.NewAuthTransport(cfg.Mimir.Auth)
+	mimirTransport, err := config.NewAuthTransport(cfg.Mimir.Auth, cfg.Mimir.InsecureSkipVerify)
 	if err != nil {
 		return fmt.Errorf("initializing Mimir auth: %w", err)
 	}

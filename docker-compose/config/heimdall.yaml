@@ -1,0 +1,30 @@
+server:
+  main:
+    addr: ":9091"
+  bundle:
+    addr: ":9092"
+
+mimir:
+  url: "http://mimir:9009"
+
+jwt:
+  jwks_url: "http://dex:5556/dex/keys"
+  issuer: "http://localhost:5556/dex"
+  audience: "grafana"
+  groups_claim: "groups"
+  user_id_claim: "email"
+
+opa:
+  url: "http://opa:8181"
+
+database:
+  driver: "postgres"
+  dsn: "postgres://heimdall:password@postgres:5432/heimdall?sslmode=disable"
+
+fanout:
+  max_concurrency: 10
+
+telemetry:
+  enabled: true
+  otlp_endpoint: "otel-collector:4317"
+  service_name: "heimdall"

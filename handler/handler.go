@@ -50,6 +50,10 @@ func (h *Handler) RegisterRoutes(r *gin.Engine, m *Metrics) {
 	r.Use(PanicRecoveryMiddleware())
 	r.Use(MetricsMiddleware(m))
 	r.Use(TracingMiddleware())
+
+	// Status actions — open while unauthenticated
+	r.GET("/api/v1/status/buildinfo", h.handleStatusBuildinfo())
+
 	r.Use(JWTMiddleware(h.cfg.JWT))
 
 	// Mimir API routes
@@ -102,7 +106,7 @@ func (h *Handler) authorizeAndDispatch(c *gin.Context, action Action, autoResolv
 		if err != nil {
 			slog.ErrorContext(ctx, "tenant resolution failed", "error", err)
 			RespondError(c, http.StatusInternalServerError, "tenant_resolution_error", "failed to resolve tenants")
-			return nil, 0, nil, true
+			return nil, http.StatusInternalServerError, nil, true
 		}
 	} else {
 		tenantIDs = resolveTenants(c)
@@ -110,28 +114,43 @@ func (h *Handler) authorizeAndDispatch(c *gin.Context, action Action, autoResolv
 
 	if len(tenantIDs) == 0 {
 		RespondError(c, http.StatusBadRequest, "missing_tenant", "X-Scope-OrgID header is required")
-		return nil, 0, nil, true
+		return nil, http.StatusBadRequest, nil, true
 	}
 
 	groups, err = h.fanOut.EvaluateTenants(ctx, identity, tenantIDs, action, "metrics")
 	if err != nil {
 		slog.ErrorContext(ctx, "OPA evaluation failed", "error", err)
 		RespondError(c, http.StatusInternalServerError, "opa_error", "authorization evaluation failed")
-		return nil, 0, nil, true
+		return nil, http.StatusInternalServerError, nil, true
 	}
 
 	if len(groups) == 0 {
 		RespondError(c, http.StatusForbidden, "access_denied", "access denied for all requested tenants")
-		return nil, 0, nil, true
+		return nil, http.StatusForbidden, nil, true
 	}
 
 	body, status, err = h.fanOut.Dispatch(ctx, groups, c.Request, action)
 	if err != nil {
 		slog.ErrorContext(ctx, "upstream dispatch failed", "error", err)
-		if status == http.StatusServiceUnavailable || status == http.StatusGatewayTimeout {
+
+		// PromQL parse failure (Invariant #95 / #252)
+		if strings.Contains(err.Error(), "parsing PromQL query") {
+			RespondError(c, http.StatusBadRequest, "invalid_query", err.Error())
+			return nil, 0, nil, true
+		}
+
+		// Fan-out overload (Invariant #18 / #111)
+		if status == http.StatusServiceUnavailable {
 			RespondError(c, status, "fanout_overloaded", err.Error())
 			return nil, 0, nil, true
 		}
+
+		// Mimir timeout → 502 (Invariant #250)
+		if status == http.StatusGatewayTimeout {
+			RespondError(c, http.StatusBadGateway, "upstream_timeout", "upstream request timed out")
+			return nil, 0, nil, true
+		}
+
 		RespondError(c, http.StatusBadGateway, "upstream_error", "upstream request failed")
 		return nil, 0, nil, true
 	}
@@ -260,4 +279,34 @@ func (h *Handler) resolveTenantsForRead(c *gin.Context) ([]string, error) {
 	}
 
 	return nil, nil
+}
+
+// handleStatusBuildinfo returns the upstream Mimir build information.
+// It bypasses OPA evaluation but still requires a valid user identity.
+func (h *Handler) handleStatusBuildinfo() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		ctx := c.Request.Context()
+
+		tenantIDs := resolveTenants(c)
+		if len(tenantIDs) == 0 {
+			// Fallback to anonymous tenant for public buildinfo check
+			// Mimir requires a tenant ID even for status endpoints when multi-tenancy is enabled.
+			tenantIDs = []string{"anonymous"}
+		}
+
+		// Create a synthetic filter group with no matchers to bypass OPA
+		groups := []filterGroup{{
+			TenantIDs: tenantIDs,
+			Matchers:  nil,
+		}}
+
+		body, status, err := h.fanOut.Dispatch(ctx, groups, c.Request, ActionRead)
+		if err != nil {
+			slog.ErrorContext(ctx, "dispatch status failed", "error", err)
+			RespondError(c, http.StatusBadGateway, "upstream_error", "failed to fetch status")
+			return
+		}
+
+		c.Data(status, "application/json", body)
+	}
 }

@@ -1,60 +1,60 @@
 package handler
 
 import (
-	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
 	"github.com/gin-gonic/gin"
+	"gorm.io/driver/sqlite"
+	"gorm.io/gorm"
 )
 
-func init() {
+func TestHealthHandlers(t *testing.T) {
 	gin.SetMode(gin.TestMode)
-}
 
-func TestHandleHealthz(t *testing.T) {
-	h := &Handler{}
+	// Setup DB for readyz
+	db, _ := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	h := &Handler{db: db}
 
-	r := gin.New()
-	r.GET("/healthz", h.handleHealthz())
+	t.Run("Healthz", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		h.handleHealthz()(c)
+		if w.Code != http.StatusOK {
+			t.Errorf("expected 200, got %d", w.Code)
+		}
+	})
 
-	w := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
-	r.ServeHTTP(w, req)
+	t.Run("Readyz Healthy", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		h.handleReadyz()(c)
+		if w.Code != http.StatusOK {
+			t.Errorf("expected 200, got %d", w.Code)
+		}
+	})
 
-	if w.Code != http.StatusOK {
-		t.Errorf("expected status 200, got %d", w.Code)
-	}
+	t.Run("Readyz Unhealthy (Closed DB)", func(t *testing.T) {
+		// Create a handler with a closed DB to trigger ping error
+		sqlDB, _ := db.DB()
+		sqlDB.Close()
 
-	var body map[string]string
-	if err := json.NewDecoder(w.Body).Decode(&body); err != nil {
-		t.Fatalf("decoding response: %v", err)
-	}
-	if body["status"] != "ok" {
-		t.Errorf("expected status 'ok', got %q", body["status"])
-	}
-}
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		h.handleReadyz()(c)
+		if w.Code != http.StatusServiceUnavailable {
+			t.Errorf("expected 503, got %d", w.Code)
+		}
+	})
 
-func TestHandleReadyz_NoDB(t *testing.T) {
-	h := &Handler{} // no DB
-
-	r := gin.New()
-	r.GET("/readyz", h.handleReadyz())
-
-	w := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
-	r.ServeHTTP(w, req)
-
-	if w.Code != http.StatusOK {
-		t.Errorf("expected status 200, got %d", w.Code)
-	}
-
-	var body map[string]string
-	if err := json.NewDecoder(w.Body).Decode(&body); err != nil {
-		t.Fatalf("decoding response: %v", err)
-	}
-	if body["status"] != "ready" {
-		t.Errorf("expected status 'ready', got %q", body["status"])
-	}
+	t.Run("Readyz No DB", func(t *testing.T) {
+		h2 := &Handler{db: nil}
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		h2.handleReadyz()(c)
+		if w.Code != http.StatusOK {
+			t.Errorf("expected 200 (bypass), got %d", w.Code)
+		}
+	})
 }

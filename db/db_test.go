@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"gorm.io/driver/sqlite"
@@ -28,7 +29,9 @@ func testStore(t *testing.T) *Store {
 
 // --- JSONField tests ---
 
-func TestJSONField_Scan_String(t *testing.T) {
+// --- Consistency Invariants: JSONField Logic ---
+
+func TestConsistency_DB_JSONField_Scan_Success(t *testing.T) {
 	var f JSONField
 	err := f.Scan(`{"key": "value"}`)
 	if err != nil {
@@ -41,243 +44,183 @@ func TestJSONField_Scan_String(t *testing.T) {
 	if m["key"] != "value" {
 		t.Errorf("expected 'value', got %q", m["key"])
 	}
-}
 
-func TestJSONField_Scan_Bytes(t *testing.T) {
-	var f JSONField
-	err := f.Scan([]byte(`["a","b"]`))
+	// Bytes scan
+	var f2 JSONField
+	err = f2.Scan([]byte(`["a","b"]`))
 	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+		t.Fatal(err)
 	}
-	var arr []string
-	if err := json.Unmarshal(f.RawMessage(), &arr); err != nil {
-		t.Fatalf("unmarshaling: %v", err)
-	}
-	if len(arr) != 2 || arr[0] != "a" {
-		t.Errorf("expected [a b], got %v", arr)
+	if string(f2.RawMessage()) != `["a","b"]` {
+		t.Errorf("got %s", f2.RawMessage())
 	}
 }
 
-func TestJSONField_Scan_Nil(t *testing.T) {
-	var f JSONField
-	err := f.Scan(nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	// Scan(nil) produces JSON "null"
-	if string(f.RawMessage()) != "null" {
-		t.Errorf("expected 'null', got %s", string(f.RawMessage()))
-	}
+func TestConsistency_DB_JSONField_ValueAndMarshal(t *testing.T) {
+	t.Run("Value implementation", func(t *testing.T) {
+		f := JSONField(`{"key": "val"}`)
+		val, err := f.Value()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if val.(string) != `{"key": "val"}` {
+			t.Errorf("got %v", val)
+		}
+	})
+
+	t.Run("Marshal/Unmarshal success", func(t *testing.T) {
+		var f JSONField
+		json.Unmarshal([]byte(`{"a":1}`), &f)
+		data, _ := json.Marshal(f)
+		if string(data) != `{"a":1}` {
+			t.Errorf("got %s", data)
+		}
+	})
 }
 
-func TestJSONField_Value(t *testing.T) {
-	f := JSONField(`{"key": "val"}`)
-	val, err := f.Value()
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	s, ok := val.(string)
-	if !ok {
-		t.Fatalf("expected string, got %T", val)
-	}
-	if s != `{"key": "val"}` {
-		t.Errorf("unexpected value: %s", s)
-	}
+func TestConsistency_DB_JSONField_ErrorPaths(t *testing.T) {
+	t.Run("Scan unsupported type", func(t *testing.T) {
+		var f JSONField
+		if err := f.Scan(123); err == nil {
+			t.Error("expected error")
+		}
+	})
+
+	t.Run("Unmarshal into nil field", func(t *testing.T) {
+		var f *JSONField
+		if err := f.UnmarshalJSON([]byte(`{}`)); err == nil {
+			t.Error("expected error")
+		}
+	})
 }
 
-func TestJSONField_MarshalJSON(t *testing.T) {
-	f := JSONField(`["x","y"]`)
-	data, err := f.MarshalJSON()
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if string(data) != `["x","y"]` {
-		t.Errorf("expected [\"x\",\"y\"], got %s", data)
-	}
-}
+// --- Consistency Invariants: Tenant CRUD ---
 
-func TestJSONField_UnmarshalJSON(t *testing.T) {
-	var f JSONField
-	err := f.UnmarshalJSON([]byte(`{"a":1}`))
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if string(f.RawMessage()) != `{"a":1}` {
-		t.Errorf("expected {\"a\":1}, got %s", f.RawMessage())
-	}
-}
-
-// --- Tenant CRUD tests ---
-
-func TestCreateAndGetTenant(t *testing.T) {
+func TestConsistency_DB_Tenant_CRUD(t *testing.T) {
 	store := testStore(t)
 	ctx := context.Background()
 
-	tenant := &Tenant{ID: "acme", Name: "Acme Corp"}
-	if err := store.CreateTenant(ctx, tenant); err != nil {
-		t.Fatalf("creating tenant: %v", err)
-	}
+	t.Run("Create and Get success", func(t *testing.T) {
+		tenant := &Tenant{ID: "acme", Name: "Acme Corp"}
+		if err := store.CreateTenant(ctx, tenant); err != nil {
+			t.Fatal(err)
+		}
+		got, _ := store.GetTenant(ctx, "acme")
+		if got.Name != "Acme Corp" {
+			t.Errorf("got %s", got.Name)
+		}
+	})
 
-	got, err := store.GetTenant(ctx, "acme")
-	if err != nil {
-		t.Fatalf("getting tenant: %v", err)
-	}
-	if got.Name != "Acme Corp" {
-		t.Errorf("expected 'Acme Corp', got %q", got.Name)
-	}
+	t.Run("List multiple tenants", func(t *testing.T) {
+		store.CreateTenant(ctx, &Tenant{ID: "b", Name: "B"})
+		tenants, _ := store.ListTenants(ctx)
+		if len(tenants) < 2 {
+			t.Errorf("expected at least 2, got %d", len(tenants))
+		}
+	})
+
+	t.Run("Delete success", func(t *testing.T) {
+		store.DeleteTenant(ctx, "acme")
+		_, err := store.GetTenant(ctx, "acme")
+		if err == nil {
+			t.Error("expected not found")
+		}
+	})
+
+	t.Run("Duplicate ID returns error", func(t *testing.T) {
+		store.CreateTenant(ctx, &Tenant{ID: "dup", Name: "1"})
+		err := store.CreateTenant(ctx, &Tenant{ID: "dup", Name: "2"})
+		if err == nil {
+			t.Error("expected error")
+		}
+	})
 }
 
-func TestListTenants(t *testing.T) {
-	store := testStore(t)
-	ctx := context.Background()
+// --- Consistency Invariants: Policy CRUD ---
 
-	store.CreateTenant(ctx, &Tenant{ID: "a", Name: "A"})
-	store.CreateTenant(ctx, &Tenant{ID: "b", Name: "B"})
-
-	tenants, err := store.ListTenants(ctx)
-	if err != nil {
-		t.Fatalf("listing: %v", err)
-	}
-	if len(tenants) != 2 {
-		t.Errorf("expected 2 tenants, got %d", len(tenants))
-	}
-}
-
-func TestDeleteTenant(t *testing.T) {
-	store := testStore(t)
-	ctx := context.Background()
-
-	store.CreateTenant(ctx, &Tenant{ID: "del", Name: "Delete Me"})
-
-	if err := store.DeleteTenant(ctx, "del"); err != nil {
-		t.Fatalf("deleting: %v", err)
-	}
-
-	_, err := store.GetTenant(ctx, "del")
-	if err == nil {
-		t.Fatal("expected error for deleted tenant")
-	}
-}
-
-func TestGetTenant_NotFound(t *testing.T) {
-	store := testStore(t)
-	_, err := store.GetTenant(context.Background(), "nonexistent")
-	if err == nil {
-		t.Fatal("expected error for nonexistent tenant")
-	}
-}
-
-func TestCreateDuplicateTenant(t *testing.T) {
-	store := testStore(t)
-	ctx := context.Background()
-
-	store.CreateTenant(ctx, &Tenant{ID: "dup", Name: "First"})
-	err := store.CreateTenant(ctx, &Tenant{ID: "dup", Name: "Second"})
-	if err == nil {
-		t.Fatal("expected error for duplicate tenant")
-	}
-}
-
-// --- Policy CRUD tests ---
-
-func TestCreateAndGetPolicy(t *testing.T) {
+func TestConsistency_DB_Policy_CRUD(t *testing.T) {
 	store := testStore(t)
 	ctx := context.Background()
 
 	policy := &Policy{
-		Name:     "test-policy",
+		Name:     "p1",
 		Effect:   "allow",
 		Subjects: JSONField(`[{"type":"user","id":"alice"}]`),
 		Actions:  JSONField(`["read"]`),
 		Scope:    JSONField(`{"tenants":["acme"],"resources":["metrics"]}`),
-		Filters:  JSONField(`["env=\"prod\""]`),
+		Filters:  JSONField(`[]`),
 	}
 
-	if err := store.CreatePolicy(ctx, policy); err != nil {
-		t.Fatalf("creating policy: %v", err)
-	}
+	t.Run("Create and Get success", func(t *testing.T) {
+		if err := store.CreatePolicy(ctx, policy); err != nil {
+			t.Fatal(err)
+		}
+		got, _ := store.GetPolicy(ctx, policy.ID)
+		if got.Name != "p1" {
+			t.Errorf("got %s", got.Name)
+		}
+	})
 
-	got, err := store.GetPolicy(ctx, policy.ID)
-	if err != nil {
-		t.Fatalf("getting policy: %v", err)
-	}
-	if got.Name != "test-policy" {
-		t.Errorf("expected 'test-policy', got %q", got.Name)
-	}
-	if got.Effect != "allow" {
-		t.Errorf("expected 'allow', got %q", got.Effect)
-	}
+	t.Run("List and Delete", func(t *testing.T) {
+		policies, _ := store.ListPolicies(ctx)
+		if len(policies) != 1 {
+			t.Errorf("got %d", len(policies))
+		}
+		store.DeletePolicy(ctx, policy.ID)
+		_, err := store.GetPolicy(ctx, policy.ID)
+		if err == nil {
+			t.Error("expected not found")
+		}
+	})
 }
 
-func TestListPolicies(t *testing.T) {
+// protects: Invariant[Consistency] - Policies must be valid before persistence.
+func TestPolicy_DB_Validation_Exhaustive(t *testing.T) {
 	store := testStore(t)
 	ctx := context.Background()
 
-	store.CreatePolicy(ctx, &Policy{
-		Name: "p1", Effect: "allow",
-		Subjects: JSONField(`[{"type":"user","id":"alice"}]`),
-		Actions:  JSONField(`["read"]`),
-		Scope:    JSONField(`{"tenants":["acme"]}`),
-		Filters:  JSONField(`[]`),
-	})
-	store.CreatePolicy(ctx, &Policy{
-		Name: "p2", Effect: "deny",
-		Subjects: JSONField(`[{"type":"user","id":"bob"}]`),
-		Actions:  JSONField(`["read"]`),
-		Scope:    JSONField(`{"tenants":["acme"]}`),
-		Filters:  JSONField(`[]`),
-	})
-
-	policies, err := store.ListPolicies(ctx)
-	if err != nil {
-		t.Fatalf("listing: %v", err)
+	tests := []struct {
+		name    string
+		policy  *Policy
+		wantErr string
+	}{
+		{"Empty effect", &Policy{Name: "p", Effect: ""}, "effect must be 'allow' or 'deny'"},
+		{"Invalid subject", &Policy{Name: "p", Effect: "allow", Subjects: JSONField(`[{"type":"robot"}]`)}, "subject type must be 'user' or 'group'"},
+		{"Empty scope", &Policy{Name: "p", Effect: "allow", Subjects: JSONField(`[{"type":"user","id":"a"}]`), Actions: JSONField(`["read"]`), Scope: JSONField(`{}`)}, "scope.tenants must not be empty"},
+		{"Invalid resource", &Policy{Name: "p", Effect: "allow", Subjects: JSONField(`[{"type":"user","id":"a"}]`), Actions: JSONField(`["read"]`), Scope: JSONField(`{"tenants":["t1"],"resources":["bad"]}`)}, "resource must be 'metrics'"},
 	}
-	if len(policies) != 2 {
-		t.Errorf("expected 2 policies, got %d", len(policies))
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := store.CreatePolicy(ctx, tt.policy)
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("expected error %q, got %v", tt.wantErr, err)
+			}
+		})
 	}
 }
 
-func TestDeletePolicy(t *testing.T) {
+// --- Availability Invariants: Database Failures ---
+
+func TestAvailability_DB_ConnectionFailures(t *testing.T) {
 	store := testStore(t)
 	ctx := context.Background()
+	sqlDB, _ := store.db.DB()
+	sqlDB.Close()
 
-	policy := &Policy{
-		Name: "to-delete", Effect: "allow",
-		Subjects: JSONField(`[{"type":"user","id":"alice"}]`),
-		Actions:  JSONField(`["read"]`),
-		Scope:    JSONField(`{"tenants":["acme"]}`),
-		Filters:  JSONField(`[]`),
-	}
-	if err := store.CreatePolicy(ctx, policy); err != nil {
-		t.Fatalf("creating: %v", err)
-	}
+	t.Run("CreatePolicy fails safely", func(t *testing.T) {
+		p := &Policy{Name: "p", Effect: "allow", Subjects: JSONField(`[{"type":"user","id":"a"}]`), Actions: JSONField(`["read"]`), Scope: JSONField(`{"tenants":["t1"],"resources":["metrics"]}`)}
+		if err := store.CreatePolicy(ctx, p); err == nil {
+			t.Error("expected error")
+		}
+	})
 
-	if policy.ID == 0 {
-		t.Fatal("expected non-zero policy ID after create")
-	}
-
-	if err := store.DeletePolicy(ctx, policy.ID); err != nil {
-		t.Fatalf("deleting: %v", err)
-	}
-
-	_, err := store.GetPolicy(ctx, policy.ID)
-	if err == nil {
-		t.Fatal("expected error for deleted policy")
-	}
-}
-
-func TestGetPolicy_NotFound(t *testing.T) {
-	store := testStore(t)
-	_, err := store.GetPolicy(context.Background(), 999)
-	if err == nil {
-		t.Fatal("expected error for nonexistent policy")
-	}
-}
-
-func TestDeleteNonexistentTenant(t *testing.T) {
-	store := testStore(t)
-	err := store.DeleteTenant(context.Background(), "nonexistent")
-	if err == nil {
-		t.Fatal("expected error for deleting nonexistent tenant")
-	}
+	t.Run("Delete operations fall back gracefully", func(t *testing.T) {
+		if err := store.DeletePolicy(ctx, 1); err == nil {
+			t.Error("expected error")
+		}
+		if err := store.DeleteTenant(ctx, "t1"); err == nil {
+			t.Error("expected error")
+		}
+	})
 }

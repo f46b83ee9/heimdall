@@ -1,0 +1,25 @@
+apiVersion: 1
+datasources:
+  - name: Heimdall
+    type: prometheus
+    access: proxy
+    url: http://heimdall:9091
+    # Forward the user's OAuth token (received by Grafana from Dex) to Heimdall
+    jsonData:
+      cacheLevel: High
+      oauthPassThru: true
+      prometheusType: Mimir
+    isDefault: true
+
+  - name: Jaeger
+    type: jaeger
+    access: proxy
+    url: http://jaeger:16686
+    isDefault: false
+
+  - name: Prometheus (Internal Metrics)
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: false
+

@@ -7,12 +7,18 @@ import (
 
 	"github.com/f46b83ee9/heimdall/config"
 	"github.com/f46b83ee9/heimdall/db"
+	"github.com/f46b83ee9/heimdall/handler"
 	"github.com/spf13/cobra"
+	"go.opentelemetry.io/otel/metric"
 )
 
 var (
 	cfgFile string
 	Version = "dev"
+
+	// Tenant Cache Performance
+	tenantCacheHits   metric.Int64Counter
+	tenantCacheMisses metric.Int64Counter
 )
 
 // rootCmd is the base command for Heimdall.
@@ -62,7 +68,16 @@ func initStoreAndBundle() (*db.Store, *db.BundleServer, error) {
 	}
 
 	store := db.NewStore(gormDB)
-	bundleServer := db.NewBundleServer(store)
+	if err := store.Migrate(); err != nil {
+		return nil, nil, fmt.Errorf("database migration failed: %w", err)
+	}
+
+	metrics, err := handler.NewMetrics()
+	if err != nil {
+		return nil, nil, fmt.Errorf("initializing metrics: %w", err)
+	}
+
+	bundleServer := db.NewBundleServer(store, metrics)
 
 	return store, bundleServer, nil
 }

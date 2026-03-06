@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"time"
 
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.opentelemetry.io/otel/attribute"
 )
 
@@ -33,30 +34,40 @@ type OPAResponse struct {
 	Result OPAResult `json:"result"`
 }
 
-// OPAClient communicates with the OPA REST API.
-type OPAClient struct {
+// OPAClient defines the interface for communicating with the OPA REST API.
+type OPAClient interface {
+	Evaluate(ctx context.Context, input OPAInput) (*OPAResult, error)
+}
+
+// opaClient implements OPAClient.
+type opaClient struct {
 	baseURL    string
 	policyPath string
 	httpClient *http.Client
+	metrics    *Metrics
 }
 
 // NewOPAClient creates a new OPA client.
 // If transport is non-nil, it is used for authentication injection.
-func NewOPAClient(baseURL, policyPath string, timeout time.Duration, transport http.RoundTripper) *OPAClient {
-	client := &http.Client{Timeout: timeout}
+func NewOPAClient(baseURL, policyPath string, timeout time.Duration, transport http.RoundTripper, metrics *Metrics) OPAClient {
+	client := &http.Client{
+		Timeout:   timeout,
+		Transport: otelhttp.NewTransport(http.DefaultTransport),
+	}
 	if transport != nil {
 		client.Transport = transport
 	}
-	return &OPAClient{
+	return &opaClient{
 		baseURL:    baseURL,
 		policyPath: policyPath,
 		httpClient: client,
+		metrics:    metrics,
 	}
 }
 
 // Evaluate sends an input to OPA and returns the authorization result.
 // OPA is called exactly once per tenant per request (invariant #1).
-func (c *OPAClient) Evaluate(ctx context.Context, input OPAInput) (*OPAResult, error) {
+func (c *opaClient) Evaluate(ctx context.Context, input OPAInput) (*OPAResult, error) {
 	ctx, span := tracer.Start(ctx, "opa.Evaluate")
 	defer span.End()
 
@@ -88,7 +99,15 @@ func (c *OPAClient) Evaluate(ctx context.Context, input OPAInput) (*OPAResult, e
 	req.Header.Set("Content-Type", "application/json")
 
 	// Execute
+	start := time.Now()
 	resp, err := c.httpClient.Do(req)
+	duration := time.Since(start).Seconds()
+
+	if c.metrics != nil {
+		c.metrics.opaEvalTotal.Add(ctx, 1)
+		c.metrics.opaEvalDuration.Record(ctx, duration)
+	}
+
 	if err != nil {
 		span.RecordError(err)
 		return nil, fmt.Errorf("OPA request failed: %w", err)

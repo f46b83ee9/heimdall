@@ -1,0 +1,102 @@
+version: "3.9"
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: heimdall
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: heimdall
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U heimdall" ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  dex:
+    image: ghcr.io/dexidp/dex:v2.41.1
+    volumes:
+      - ./config/dex.yaml:/etc/dex/config.docker.yaml
+    ports:
+      - "5556:5556"
+    command: [ "dex", "serve", "/etc/dex/config.docker.yaml" ]
+
+  mimir:
+    image: grafana/mimir:3.0.3
+    volumes:
+      - ./config/mimir.yaml:/etc/mimir/mimir.yaml
+    command: [ "-config.file=/etc/mimir/mimir.yaml" ]
+    ports:
+      - "9009:9009"
+
+  heimdall:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    command: [ "serve", "--config=/etc/heimdall/config.yaml" ]
+    volumes:
+      - ./config/heimdall.yaml:/etc/heimdall/config.yaml
+    ports:
+      - "9091:9091" # proxy
+      - "9092:9092" # bundle and metrics
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mimir:
+        condition: service_started
+      dex:
+        condition: service_started
+
+  opa:
+    image: openpolicyagent/opa:1.14.0
+    command:
+      - "run"
+      - "--server"
+      - "--log-format=json"
+      - "--addr=0.0.0.0:8181"
+      - "--set=services.heimdall.url=http://heimdall:9092"
+      - "--set=bundles.authz.service=heimdall"
+      - "--set=bundles.authz.resource=bundles/bundle.tar.gz"
+      - "--set=bundles.authz.polling.min_delay_seconds=2"
+      - "--set=bundles.authz.polling.max_delay_seconds=5"
+    ports:
+      - "8181:8181"
+    depends_on:
+      - heimdall
+
+  grafana:
+    image: grafana/grafana:11.5.2
+    volumes:
+      - ./config/grafana-provisioning:/etc/grafana/provisioning
+      - ./config/grafana.ini:/etc/grafana/grafana.ini
+    ports:
+      - "3000:3000"
+    depends_on:
+      - dex
+      - heimdall
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.76.0
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+    ports:
+      - "16686:16686" # UI
+
+  prometheus:
+    image: prom/prometheus:v3.2.1
+    volumes:
+      - ./config/prometheus.yaml:/etc/prometheus/prometheus.yml
+    ports:
+      - "9090:9090"
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.100.0
+    volumes:
+      - ./config/otel-collector.yaml:/etc/otelcol-contrib/config.yaml
+    ports:
+      - "4317:4317"
+      - "4318:4318"
+    depends_on:
+      - jaeger
+      - prometheus

@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -40,44 +41,50 @@ type BundleServer struct {
 	mu         sync.RWMutex
 	revision   string
 	bundleData []byte
+	updatedAt  time.Time
+	metrics    Metrics
+}
+
+// Metrics is a subset interface to avoid circular dependencies if needed,
+// but since both are in the same or related packages, we can use the concrete type
+// or a simplified interface. Here we use the concrete type via a local alias or interface if needed.
+// For now, we'll assume we can pass the Metrics struct from handler.
+type Metrics interface {
+	RecordBundleRebuild(ctx context.Context)
+	UpdateActiveTenants(ctx context.Context, count int64)
 }
 
 // NewBundleServer creates a new BundleServer that serves bundles from memory.
-func NewBundleServer(store *Store) *BundleServer {
+func NewBundleServer(store *Store, metrics Metrics) *BundleServer {
 	return &BundleServer{
-		store: store,
+		store:   store,
+		metrics: metrics,
 	}
 }
 
 // Rebuild atomically rebuilds the OPA bundle from the current database state.
 // It is mutex-protected, idempotent, and context-aware.
 func (bs *BundleServer) Rebuild(ctx context.Context) (err error) {
-	ctx, span := tracer.Start(ctx, "bundle.Rebuild")
-	defer span.End()
-
 	bs.mu.Lock()
 	defer bs.mu.Unlock()
 
-	// Panic safety
+	// panic safety (Invariant #134)
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("panic during bundle rebuild: %v", r)
-			span.RecordError(err)
-			slog.ErrorContext(ctx, "panic during bundle rebuild", "error", err)
+			slog.ErrorContext(ctx, "panic during bundle rebuild", "error", err, "stack", string(debug.Stack()))
 		}
 	}()
 
 	// Fetch all tenants
 	tenants, fetchErr := bs.store.ListTenants(ctx)
 	if fetchErr != nil {
-		span.RecordError(fetchErr)
 		return fmt.Errorf("fetching tenants for bundle: %w", fetchErr)
 	}
 
 	// Fetch all policies
 	policies, fetchErr := bs.store.ListPolicies(ctx)
 	if fetchErr != nil {
-		span.RecordError(fetchErr)
 		return fmt.Errorf("fetching policies for bundle: %w", fetchErr)
 	}
 
@@ -133,25 +140,39 @@ func (bs *BundleServer) Rebuild(ctx context.Context) (err error) {
 	hash := sha256.Sum256(dataJSON)
 	revision := fmt.Sprintf("%x", hash[:8])
 
-	span.SetAttributes(
-		attribute.Int("bundle.tenants", len(tenants)),
-		attribute.Int("bundle.policies", len(policies)),
-		attribute.String("bundle.revision", revision),
-	)
+	// Atomic swap and trace ONLY if revision changed (reduce span and log noise)
+	if revision != bs.revision {
+		ctx, span := tracer.Start(ctx, "bundle.Rebuild")
+		defer span.End()
 
-	// Build the bundle in-memory
-	var buf bytes.Buffer
-	if writeErr := writeBundleMem(&buf, dataJSON, opa.AuthzRego, revision); writeErr != nil {
-		return fmt.Errorf("writing in-memory bundle: %w", writeErr)
+		span.SetAttributes(
+			attribute.Int("bundle.tenants", len(tenants)),
+			attribute.Int("bundle.policies", len(policies)),
+			attribute.String("bundle.revision", revision),
+		)
+
+		// Build the bundle in-memory
+		var buf bytes.Buffer
+		if writeErr := writeBundleMem(&buf, dataJSON, opa.AuthzRego, revision); writeErr != nil {
+			span.RecordError(writeErr)
+			return fmt.Errorf("writing in-memory bundle: %w", writeErr)
+		}
+
+		bs.bundleData = buf.Bytes()
+		bs.revision = revision
+		bs.updatedAt = time.Now()
+
+		slog.InfoContext(ctx, "bundle rebuilt",
+			"revision", revision,
+			"tenants", len(tenants),
+			"policies", len(policies),
+		)
+
+		if bs.metrics != nil {
+			bs.metrics.RecordBundleRebuild(ctx)
+			bs.metrics.UpdateActiveTenants(ctx, int64(len(tenants)))
+		}
 	}
-
-	bs.bundleData = buf.Bytes()
-	bs.revision = revision
-	slog.InfoContext(ctx, "bundle rebuilt",
-		"revision", revision,
-		"tenants", len(tenants),
-		"policies", len(policies),
-	)
 
 	return nil
 }
@@ -216,6 +237,7 @@ func (bs *BundleServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	bs.mu.RLock()
 	data := bs.bundleData
 	rev := bs.revision
+	updated := bs.updatedAt
 	bs.mu.RUnlock()
 
 	if len(data) == 0 {
@@ -223,13 +245,8 @@ func (bs *BundleServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/gzip")
-	w.Header().Set("ETag", rev)
-	w.WriteHeader(http.StatusOK)
-
-	if _, writeErr := w.Write(data); writeErr != nil {
-		slog.Error("failed to write bundle response", "error", writeErr)
-	}
+	w.Header().Set("ETag", fmt.Sprintf("\"%s\"", rev))
+	http.ServeContent(w, r, "bundle.tar.gz", updated, bytes.NewReader(data))
 }
 
 // StartPolling starts a background goroutine that periodically rebuilds the bundle.
@@ -256,7 +273,7 @@ func (bs *BundleServer) StartPolling(ctx context.Context, interval time.Duration
 // NOTE: database/sql does not support async notifications natively.
 // For production use, replace with github.com/lib/pq or pgx listener.
 // This implementation falls back to polling on the same interval.
-func (bs *BundleServer) StartListenNotify(ctx context.Context) error {
+func (bs *BundleServer) StartListenNotify(ctx context.Context, interval time.Duration) error {
 	sqlDB, err := bs.store.DB().DB()
 	if err != nil {
 		return fmt.Errorf("getting underlying sql.DB: %w", err)
@@ -277,7 +294,7 @@ func (bs *BundleServer) StartListenNotify(ctx context.Context) error {
 
 	// Fall back to polling since database/sql cannot receive async notifications.
 	// The caller (serve.go) would need pgx/lib-pq for true push-based change detection.
-	bs.StartPolling(ctx, 1*time.Second)
+	bs.StartPolling(ctx, interval)
 
 	return nil
 }

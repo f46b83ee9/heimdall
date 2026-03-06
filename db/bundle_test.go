@@ -8,7 +8,9 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/f46b83ee9/heimdall/db"
 	"gorm.io/driver/sqlite"
@@ -17,7 +19,7 @@ import (
 
 // setupStore creates an in-memory SQLite store for testing.
 func setupStore(t *testing.T) *db.Store {
-	gormDB, err := gorm.Open(sqlite.Open("file::memory:?cache=shared"), &gorm.Config{})
+	gormDB, err := gorm.Open(sqlite.Open("file:memdb"+t.Name()+"?mode=memory&cache=private"), &gorm.Config{})
 	if err != nil {
 		t.Fatalf("failed to open memory db: %v", err)
 	}
@@ -39,7 +41,7 @@ func parseJSON(t *testing.T, s string) db.JSONField {
 
 func TestBundleServer_ServeHTTP_EmptyMemory(t *testing.T) {
 	store := setupStore(t)
-	bs := db.NewBundleServer(store) // Mem-backed now
+	bs := db.NewBundleServer(store, nil) // passing nil is fine for now as it's optional
 
 	req := httptest.NewRequest(http.MethodGet, "/bundles/bundle.tar.gz", nil)
 	w := httptest.NewRecorder()
@@ -55,7 +57,7 @@ func TestBundleServer_ServeHTTP_EmptyMemory(t *testing.T) {
 func TestBundleServer_RebuildAndServe(t *testing.T) {
 	ctx := context.Background()
 	store := setupStore(t)
-	bs := db.NewBundleServer(store) // Mem-backed
+	bs := db.NewBundleServer(store, nil)
 
 	// Insert test data
 	err := store.CreateTenant(ctx, &db.Tenant{ID: "t1", Name: "Tenant 1"})
@@ -67,7 +69,7 @@ func TestBundleServer_RebuildAndServe(t *testing.T) {
 		Effect:   "allow",
 		Subjects: parseJSON(t, `[{"type":"user","id":"alice"}]`),
 		Actions:  parseJSON(t, `["read"]`),
-		Scope:    parseJSON(t, `{"tenants":["t1"]}`),
+		Scope:    parseJSON(t, `{"tenants":["t1"],"resources":["metrics"]}`),
 		Filters:  parseJSON(t, `[]`),
 	}
 	if err := store.CreatePolicy(ctx, p); err != nil {
@@ -140,5 +142,91 @@ func TestBundleServer_RebuildAndServe(t *testing.T) {
 	}
 	if !filesFound[".manifest"] {
 		t.Fatal(".manifest not found in tarball")
+	}
+}
+
+func TestBundleServer_StartPolling(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	store := setupStore(t)
+	bs := db.NewBundleServer(store, nil)
+
+	// Start polling with very short interval
+	go bs.StartPolling(ctx, 100*time.Millisecond)
+
+	// Wait for at least one poll
+	time.Sleep(250 * time.Millisecond)
+}
+
+func TestBundleServer_StartListenNotify_Exhaustive(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	store := setupStore(t)
+	bs := db.NewBundleServer(store, nil)
+
+	// SQLite doesn't support LISTEN/NOTIFY, so it should exit early with a log (or just continue if loop is started)
+	// Actually it checks if driver is postgres.
+	bs.StartListenNotify(ctx, 100*time.Millisecond) // Should return quickly because not postgres
+}
+
+func TestBundleServer_Rebuild_Error(t *testing.T) {
+	ctx := context.Background()
+	// Store with closed DB to trigger errors
+	gormDB, _ := gorm.Open(sqlite.Open("file::memory:?cache=shared"), &gorm.Config{})
+	sqlDB, _ := gormDB.DB()
+	s := db.NewStore(gormDB)
+
+	bs := db.NewBundleServer(s, nil)
+
+	// Close DB to break it
+	sqlDB.Close()
+
+	err := bs.Rebuild(ctx)
+	if err == nil {
+		t.Error("expected error from Rebuild on broken DB")
+	}
+}
+
+func TestBundleServer_Rebuild_UnmarshalError(t *testing.T) {
+	ctx := context.Background()
+	store := setupStore(t)
+	bs := db.NewBundleServer(store, nil)
+
+	// Create a policy with invalid JSON in subjects
+	// Note: Store.CreatePolicy might check it, but let's see.
+	// Actually, we can use raw GORM to insert it.
+	gormDB := store.DB()
+	p := db.Policy{
+		Name:     "bad-json",
+		Effect:   "allow",
+		Subjects: db.JSONField(`{invalid}`),
+	}
+	gormDB.Create(&p)
+
+	err := bs.Rebuild(ctx)
+	if err == nil {
+		t.Error("expected unmarshal error")
+	} else if !strings.Contains(err.Error(), "unmarshaling policy") {
+		t.Errorf("expected unmarshaling error, got %v", err)
+	}
+}
+
+func TestBundleServer_ServeHTTP_Head(t *testing.T) {
+	ctx := context.Background()
+	store := setupStore(t)
+	bs := db.NewBundleServer(store, nil)
+	bs.Rebuild(ctx)
+
+	req := httptest.NewRequest(http.MethodHead, "/bundles/bundle.tar.gz", nil)
+	w := httptest.NewRecorder()
+	bs.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200, got %d", w.Code)
+	}
+	if len(w.Body.Bytes()) != 0 {
+		t.Errorf("expected empty body for HEAD, got %d bytes", len(w.Body.Bytes()))
 	}
 }

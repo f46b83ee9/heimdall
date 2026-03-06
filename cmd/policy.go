@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"strconv"
@@ -18,32 +19,60 @@ var policyCmd = &cobra.Command{
 }
 
 var policyCreateCmd = &cobra.Command{
-	Use:   "create [json-file]",
-	Short: "Create a policy from a JSON file",
-	Args:  cobra.ExactArgs(1),
+	Use:   "create [json-file|-]",
+	Short: "Create one or more policies from a JSON file or stdin",
+	Args:  cobra.MaximumNArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		return withStoreAndBundle(func(ctx context.Context, store *db.Store, bundleServer *db.BundleServer) error {
-			// Read policy from JSON file
-			data, err := os.ReadFile(args[0])
+			var data []byte
+			var err error
+
+			// 1. Read input from file or stdin
+			if len(args) == 0 || args[0] == "-" {
+				data, err = io.ReadAll(os.Stdin)
+			} else {
+				data, err = os.ReadFile(args[0])
+			}
 			if err != nil {
-				return fmt.Errorf("reading policy file: %w", err)
+				return fmt.Errorf("reading input: %w", err)
 			}
 
-			var policy db.Policy
-			if err := json.Unmarshal(data, &policy); err != nil {
-				return fmt.Errorf("parsing policy JSON: %w", err)
+			// 2. Parse input (handle single object or array)
+			var raw json.RawMessage
+			if err := json.Unmarshal(data, &raw); err != nil {
+				return fmt.Errorf("invalid JSON: %w", err)
 			}
 
-			if err := store.CreatePolicy(ctx, &policy); err != nil {
-				return fmt.Errorf("failed to create policy: %w", err)
+			var policies []db.Policy
+			if raw[0] == '[' {
+				// It's an array
+				if err := json.Unmarshal(raw, &policies); err != nil {
+					return fmt.Errorf("parsing policy array: %w", err)
+				}
+			} else {
+				// It's a single object
+				var p db.Policy
+				if err := json.Unmarshal(raw, &p); err != nil {
+					return fmt.Errorf("parsing policy object: %w", err)
+				}
+				policies = append(policies, p)
 			}
 
-			// Rebuild bundle after policy change (invariant #11)
+			// 3. Create policies
+			for _, p := range policies {
+				// Clear ID for creation to ensure auto-increment or new record
+				p.ID = 0
+				if err := store.CreatePolicy(ctx, &p); err != nil {
+					return fmt.Errorf("failed to create policy %q: %w", p.Name, err)
+				}
+				slog.Info("policy created", "id", p.ID, "name", p.Name)
+			}
+
+			// 4. Rebuild bundle once for the whole batch (Rule 277)
 			if err := bundleServer.Rebuild(ctx); err != nil {
-				return fmt.Errorf("bundle rebuild failed after policy create: %w", err)
+				return fmt.Errorf("bundle rebuild failed after batch create: %w", err)
 			}
 
-			slog.Info("policy created", "id", policy.ID, "name", policy.Name)
 			return nil
 		})
 	},

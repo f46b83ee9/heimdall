@@ -34,10 +34,7 @@ func RewriteQuery(ctx context.Context, query string, matchers []*labels.Matcher)
 	}
 
 	// Walk the AST and inject matchers into every VectorSelector
-	if err := injectMatchers(expr, matchers); err != nil {
-		span.RecordError(err)
-		return "", fmt.Errorf("injecting matchers: %w", err)
-	}
+	injectMatchers(expr, matchers)
 
 	rewritten := expr.String()
 	span.SetAttributes(attribute.String("rewrite.result_query", rewritten))
@@ -47,19 +44,14 @@ func RewriteQuery(ctx context.Context, query string, matchers []*labels.Matcher)
 
 // injectMatchers walks the PromQL AST and injects the provided matchers into
 // all VectorSelector nodes it encounters.
-func injectMatchers(node parser.Node, matchers []*labels.Matcher) error {
-	var walkErr error
+func injectMatchers(node parser.Node, matchers []*labels.Matcher) {
 	parser.Inspect(node, func(n parser.Node, path []parser.Node) error {
-		if walkErr != nil {
-			return nil // fast return on error
-		}
 		switch v := n.(type) {
 		case *parser.VectorSelector:
 			v.LabelMatchers = mergeMatchers(v.LabelMatchers, matchers)
 		}
 		return nil
 	})
-	return walkErr
 }
 
 // RewriteMatchParams rewrites a list of match[] parameters (used by /api/v1/series).
